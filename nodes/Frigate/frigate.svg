@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="frigateShield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 3 L57 12 V31 C57 46 46 56 32 61 C18 56 7 46 7 31 V12 Z" fill="url(#frigateShield)"/>
+  <path d="M32 3 L57 12 V31 C57 46 46 56 32 61 C18 56 7 46 7 31 V12 Z" fill="none" stroke="#1e3a8a" stroke-width="2" stroke-linejoin="round"/>
+  <g fill="#ffffff">
+    <rect x="17" y="26" width="22" height="14" rx="2.5"/>
+    <path d="M39 30 L48 25 V41 L39 36 Z"/>
+  </g>
+  <circle cx="26" cy="33" r="4.6" fill="#1d4ed8"/>
+  <circle cx="26" cy="33" r="2" fill="#bfdbfe"/>
+  <circle cx="44" cy="19" r="3" fill="#22c55e"/>
+</svg>

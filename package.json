@@ -1,0 +1,67 @@
+{
+	"name": "n8n-nodes-frigate",
+	"version": "0.1.0",
+	"description": "n8n community node to control and monitor Frigate NVR over its real-time WebSocket (/ws) API",
+	"keywords": [
+		"n8n-community-node-package",
+		"n8n",
+		"frigate",
+		"nvr",
+		"mqtt",
+		"websocket",
+		"camera",
+		"surveillance"
+	],
+	"license": "MIT",
+	"homepage": "https://github.com/nbetcher/n8n-nodes-frigate",
+	"author": {
+		"name": "Nick Betcher"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/nbetcher/n8n-nodes-frigate.git"
+	},
+	"engines": {
+		"node": ">=18.10"
+	},
+	"main": "index.js",
+	"scripts": {
+		"build": "tsc && gulp build:icons",
+		"dev": "tsc --watch",
+		"format": "prettier nodes credentials --write",
+		"lint": "eslint nodes credentials package.json",
+		"lintfix": "eslint nodes credentials package.json --fix",
+		"prepublishOnly": "npm run build && eslint -c .eslintrc.prepublish.js nodes credentials package.json"
+	},
+	"files": [
+		"dist"
+	],
+	"n8n": {
+		"n8nNodesApiVersion": 1,
+		"credentials": [
+			"dist/credentials/FrigateApi.credentials.js"
+		],
+		"nodes": [
+			"dist/nodes/Frigate/Frigate.node.js",
+			"dist/nodes/Frigate/FrigateTrigger.node.js"
+		]
+	},
+	"devDependencies": {
+		"@types/node": "^20.14.0",
+		"@types/ws": "^8.5.10",
+		"@typescript-eslint/eslint-plugin": "^7.15.0",
+		"@typescript-eslint/parser": "^7.15.0",
+		"eslint": "^8.56.0",
+		"eslint-plugin-n8n-nodes-base": "^1.16.1",
+		"gulp": "^4.0.2",
+		"n8n-workflow": "*",
+		"prettier": "^3.3.2",
+		"typescript": "^5.5.3"
+	},
+	"peerDependencies": {
+		"n8n-workflow": "*"
+	},
+	"dependencies": {
+		"ws": "^8.18.0"
+	}
+}

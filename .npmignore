@@ -1,0 +1,17 @@
+# Source - only ship the compiled dist directory
+*.ts
+!*.d.ts
+nodes
+credentials
+tsconfig.json
+tsconfig.tsbuildinfo
+gulpfile.js
+.eslintrc.js
+.eslintrc.prepublish.js
+.prettierrc.js
+.gitignore
+.editorconfig
+.vscode
+.idea
+*.log
+node_modules

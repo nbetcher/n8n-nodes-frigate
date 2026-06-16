@@ -1,0 +1,771 @@
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	INodeExecutionData,
+	INodeType,
+	INodeTypeDescription,
+} from 'n8n-workflow';
+import { NodeOperationError } from 'n8n-workflow';
+
+import {
+	birdseyeModeOptions,
+	onOffOptions,
+	ptzCommandOptions,
+} from './FrigateDescription';
+import type { IFrigateCredentials } from './GenericFunctions';
+import {
+	buildAuthHeaders,
+	buildWsUrl,
+	normalizePayload,
+	publishAndAwaitState,
+	publishEnvelope,
+	resolveTopicTemplate,
+	subscribeOnce,
+} from './GenericFunctions';
+
+/**
+ * Maps each toggle/setter operation to its /set topic template and the matching
+ * /state read-back topic template (or null when there is no read-back).
+ */
+interface IOperationMeta {
+	setTopic: string;
+	stateTopic: string | null;
+}
+
+const OPERATION_META: Record<string, IOperationMeta> = {
+	setDetect: { setTopic: '<camera>/detect/set', stateTopic: '<camera>/detect/state' },
+	setRecordings: { setTopic: '<camera>/recordings/set', stateTopic: '<camera>/recordings/state' },
+	setSnapshots: { setTopic: '<camera>/snapshots/set', stateTopic: '<camera>/snapshots/state' },
+	setAudio: { setTopic: '<camera>/audio/set', stateTopic: '<camera>/audio/state' },
+	setMotion: { setTopic: '<camera>/motion/set', stateTopic: '<camera>/motion/state' },
+	setImproveContrast: {
+		setTopic: '<camera>/improve_contrast/set',
+		stateTopic: '<camera>/improve_contrast/state',
+	},
+	setEnabled: { setTopic: '<camera>/enabled/set', stateTopic: '<camera>/enabled/state' },
+	setMotionThreshold: {
+		setTopic: '<camera>/motion_threshold/set',
+		stateTopic: '<camera>/motion_threshold/state',
+	},
+	setMotionContourArea: {
+		setTopic: '<camera>/motion_contour_area/set',
+		stateTopic: '<camera>/motion_contour_area/state',
+	},
+	setBirdseye: { setTopic: '<camera>/birdseye/set', stateTopic: '<camera>/birdseye/state' },
+	setBirdseyeMode: {
+		setTopic: '<camera>/birdseye_mode/set',
+		stateTopic: '<camera>/birdseye_mode/state',
+	},
+	ptz: { setTopic: '<camera>/ptz', stateTopic: null },
+	setPtzAutotracker: {
+		setTopic: '<camera>/ptz_autotracker/set',
+		stateTopic: '<camera>/ptz_autotracker/state',
+	},
+	setGlobalNotifications: { setTopic: 'notifications/set', stateTopic: 'notifications/state' },
+	setCameraNotifications: {
+		setTopic: '<camera>/notifications/set',
+		stateTopic: '<camera>/notifications/state',
+	},
+	suspendNotifications: {
+		setTopic: '<camera>/notifications/suspend',
+		stateTopic: '<camera>/notifications/suspended',
+	},
+	setAudioTranscription: {
+		setTopic: '<camera>/audio_transcription/set',
+		stateTopic: null,
+	},
+	setReviewAlerts: {
+		setTopic: '<camera>/review_alerts/set',
+		stateTopic: '<camera>/review_alerts/state',
+	},
+	setReviewDetections: {
+		setTopic: '<camera>/review_detections/set',
+		stateTopic: '<camera>/review_detections/state',
+	},
+	setObjectDescriptions: {
+		setTopic: '<camera>/object_descriptions/set',
+		stateTopic: '<camera>/object_descriptions/state',
+	},
+	setReviewDescriptions: {
+		setTopic: '<camera>/review_descriptions/set',
+		stateTopic: '<camera>/review_descriptions/state',
+	},
+	setMotionMask: {
+		setTopic: '<camera>/motion_mask/<mask_name>/set',
+		stateTopic: '<camera>/motion_mask/<mask_name>/state',
+	},
+	setObjectMask: {
+		setTopic: '<camera>/object_mask/<mask_name>/set',
+		stateTopic: '<camera>/object_mask/<mask_name>/state',
+	},
+	setZone: {
+		setTopic: '<camera>/zone/<zone_name>/set',
+		stateTopic: '<camera>/zone/<zone_name>/state',
+	},
+	restart: { setTopic: 'restart', stateTopic: null },
+};
+
+/** Operations that take a camera + ON/OFF value and expose a /state read-back. */
+const ON_OFF_CAMERA_OPS = [
+	'setDetect',
+	'setRecordings',
+	'setSnapshots',
+	'setAudio',
+	'setMotion',
+	'setImproveContrast',
+	'setEnabled',
+	'setBirdseye',
+	'setPtzAutotracker',
+	'setCameraNotifications',
+	'setAudioTranscription',
+	'setReviewAlerts',
+	'setReviewDetections',
+	'setObjectDescriptions',
+	'setReviewDescriptions',
+];
+
+const AWAITABLE_OPS = Object.entries(OPERATION_META)
+	.filter(([, meta]) => meta.stateTopic !== null)
+	.map(([op]) => op);
+
+export class Frigate implements INodeType {
+	description: INodeTypeDescription = {
+		displayName: 'Frigate',
+		name: 'frigate',
+		icon: 'file:frigate.svg',
+		group: ['output'],
+		version: 1,
+		subtitle: '={{$parameter["operation"]}}',
+		description: 'Control Frigate over its real-time /ws API',
+		defaults: {
+			name: 'Frigate',
+		},
+		inputs: ['main'],
+		outputs: ['main'],
+		credentials: [
+			{
+				name: 'frigateApi',
+				required: true,
+			},
+		],
+		properties: [
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				// eslint-disable-next-line n8n-nodes-base/node-param-options-type-unsorted-items
+				options: [
+					{
+						name: 'Set Detect',
+						value: 'setDetect',
+						action: 'Set object detection on or off',
+						description: 'Turn object detection ON/OFF for a camera',
+					},
+					{
+						name: 'Set Recordings',
+						value: 'setRecordings',
+						action: 'Set recordings on or off',
+						description: 'Turn recordings ON/OFF for a camera',
+					},
+					{
+						name: 'Set Snapshots',
+						value: 'setSnapshots',
+						action: 'Set snapshots on or off',
+						description: 'Turn snapshot capture ON/OFF for a camera',
+					},
+					{
+						name: 'Set Audio Detection',
+						value: 'setAudio',
+						action: 'Set audio detection on or off',
+						description: 'Turn audio detection ON/OFF for a camera',
+					},
+					{
+						name: 'Set Motion Detection',
+						value: 'setMotion',
+						action: 'Set motion detection on or off',
+						description: 'Turn motion detection ON/OFF for a camera',
+					},
+					{
+						name: 'Set Improve Contrast',
+						value: 'setImproveContrast',
+						action: 'Set improve contrast on or off',
+						description: 'Turn contrast improvement for motion ON/OFF for a camera',
+					},
+					{
+						name: 'Set Camera Enabled',
+						value: 'setEnabled',
+						action: 'Set whole camera processing on or off',
+						description: "Turn Frigate's whole-camera processing ON/OFF",
+					},
+					{
+						name: 'Set Motion Threshold',
+						value: 'setMotionThreshold',
+						action: 'Set the motion sensitivity threshold',
+						description: 'Set the motion sensitivity threshold',
+					},
+					{
+						name: 'Set Motion Contour Area',
+						value: 'setMotionContourArea',
+						action: 'Set the motion contour area',
+						description: 'Set the minimum contour size counted as motion',
+					},
+					{
+						name: 'Set Birdseye (Camera)',
+						value: 'setBirdseye',
+						action: 'Set camera birdseye inclusion on or off',
+						description: 'Include/exclude this camera in the birdseye view',
+					},
+					{
+						name: 'Set Birdseye Mode',
+						value: 'setBirdseyeMode',
+						action: 'Set the camera birdseye mode',
+						description: 'Set when the camera appears in birdseye',
+					},
+					{
+						name: 'PTZ Command',
+						value: 'ptz',
+						action: 'Send a PTZ command',
+						description: 'Send a PTZ command to an ONVIF-capable camera',
+					},
+					{
+						name: 'Set PTZ Autotracker',
+						value: 'setPtzAutotracker',
+						action: 'Set PTZ autotracking on or off',
+						description: 'Turn PTZ autotracking ON/OFF for a camera',
+					},
+					{
+						name: 'Set Global Notifications',
+						value: 'setGlobalNotifications',
+						action: 'Set notifications on or off for all cameras',
+						description: 'Enable/disable notifications for ALL cameras',
+					},
+					{
+						name: 'Set Per-Camera Notifications',
+						value: 'setCameraNotifications',
+						action: 'Set per camera notifications on or off',
+						description: 'Turn per-camera notifications ON/OFF',
+					},
+					{
+						name: 'Suspend Per-Camera Notifications',
+						value: 'suspendNotifications',
+						action: 'Suspend a camera notifications for n minutes',
+						description: "Suspend a camera's notifications for N minutes",
+					},
+					{
+						name: 'Set Audio Transcription',
+						value: 'setAudioTranscription',
+						action: 'Set live audio transcription on or off',
+						description: 'Turn live audio transcription ON/OFF for a camera (0.16+)',
+					},
+					{
+						name: 'Set Review Alerts',
+						value: 'setReviewAlerts',
+						action: 'Set alert review items on or off',
+						description: "Turn generation of 'alert' review items ON/OFF for a camera (0.16+)",
+					},
+					{
+						name: 'Set Review Detections',
+						value: 'setReviewDetections',
+						action: 'Set detection review items on or off',
+						description: "Turn generation of 'detection' review items ON/OFF for a camera (0.16+)",
+					},
+					{
+						name: 'Set Object Descriptions',
+						value: 'setObjectDescriptions',
+						action: 'Set gen ai object descriptions on or off',
+						description: 'Turn GenAI object descriptions ON/OFF for a camera (0.16+)',
+					},
+					{
+						name: 'Set Review Descriptions',
+						value: 'setReviewDescriptions',
+						action: 'Set gen ai review descriptions on or off',
+						description: 'Turn GenAI review summaries ON/OFF for a camera (0.16+)',
+					},
+					{
+						name: 'Set Motion Mask',
+						value: 'setMotionMask',
+						action: 'Set a named motion mask on or off',
+						description: 'Enable/disable a named motion mask on a camera',
+					},
+					{
+						name: 'Set Object Mask',
+						value: 'setObjectMask',
+						action: 'Set a named object mask on or off',
+						description: 'Enable/disable a named object mask on a camera',
+					},
+					{
+						name: 'Set Zone',
+						value: 'setZone',
+						action: 'Set a named zone on or off',
+						description: 'Enable/disable a named zone on a camera',
+					},
+					{
+						name: 'Restart',
+						value: 'restart',
+						action: 'Restart frigate',
+						description: 'Cause Frigate to exit so Docker restarts the container',
+					},
+					{
+						name: 'Publish to Custom Topic',
+						value: 'publishCustom',
+						action: 'Publish to a custom topic',
+						description: 'Publish an arbitrary { topic, payload } envelope over /ws',
+					},
+					{
+						name: 'Get Current Value',
+						value: 'getCurrentValue',
+						action: 'Get the current value of a topic',
+						description: 'Subscribe once and return the next value of a topic',
+					},
+				],
+				default: 'setDetect',
+			},
+
+			// --- Camera (used by most operations) ---
+			{
+				displayName: 'Camera',
+				name: 'camera',
+				type: 'string',
+				default: '',
+				required: true,
+				placeholder: 'front_door',
+				displayOptions: {
+					show: {
+						operation: [
+							'setDetect',
+							'setRecordings',
+							'setSnapshots',
+							'setAudio',
+							'setMotion',
+							'setImproveContrast',
+							'setEnabled',
+							'setMotionThreshold',
+							'setMotionContourArea',
+							'setBirdseye',
+							'setBirdseyeMode',
+							'ptz',
+							'setPtzAutotracker',
+							'setCameraNotifications',
+							'suspendNotifications',
+							'setAudioTranscription',
+							'setReviewAlerts',
+							'setReviewDetections',
+							'setObjectDescriptions',
+							'setReviewDescriptions',
+							'setMotionMask',
+							'setObjectMask',
+							'setZone',
+						],
+					},
+				},
+				description: 'The camera name as configured in Frigate',
+			},
+
+			// --- ON/OFF value (toggle operations) ---
+			{
+				displayName: 'Value',
+				name: 'value',
+				type: 'options',
+				// eslint-disable-next-line n8n-nodes-base/node-param-options-type-unsorted-items
+				options: onOffOptions,
+				default: 'ON',
+				required: true,
+				displayOptions: {
+					show: {
+						operation: [
+							'setDetect',
+							'setRecordings',
+							'setSnapshots',
+							'setAudio',
+							'setMotion',
+							'setImproveContrast',
+							'setEnabled',
+							'setBirdseye',
+							'setPtzAutotracker',
+							'setGlobalNotifications',
+							'setCameraNotifications',
+							'setAudioTranscription',
+							'setReviewAlerts',
+							'setReviewDetections',
+							'setObjectDescriptions',
+							'setReviewDescriptions',
+							'setMotionMask',
+							'setObjectMask',
+							'setZone',
+						],
+					},
+				},
+				description: 'Whether to turn the feature on or off',
+			},
+
+			// --- Numeric value (threshold / contour area) ---
+			{
+				displayName: 'Value',
+				name: 'numericValue',
+				type: 'number',
+				default: 30,
+				required: true,
+				displayOptions: {
+					show: {
+						operation: ['setMotionThreshold', 'setMotionContourArea'],
+					},
+				},
+				description: 'The integer value to set',
+			},
+
+			// --- Minutes (suspend notifications) ---
+			{
+				displayName: 'Minutes',
+				name: 'minutes',
+				type: 'number',
+				default: 30,
+				required: true,
+				displayOptions: {
+					show: {
+						operation: ['suspendNotifications'],
+					},
+				},
+				description: 'Number of minutes to suspend notifications for',
+			},
+
+			// --- Birdseye mode ---
+			{
+				displayName: 'Mode',
+				name: 'birdseyeMode',
+				type: 'options',
+				// eslint-disable-next-line n8n-nodes-base/node-param-options-type-unsorted-items
+				options: birdseyeModeOptions,
+				default: 'CONTINUOUS',
+				required: true,
+				displayOptions: {
+					show: {
+						operation: ['setBirdseyeMode'],
+					},
+				},
+				description: 'When the camera should appear in birdseye',
+			},
+
+			// --- PTZ command ---
+			{
+				displayName: 'Command',
+				name: 'ptzCommand',
+				type: 'options',
+				// eslint-disable-next-line n8n-nodes-base/node-param-options-type-unsorted-items
+				options: ptzCommandOptions,
+				default: 'MOVE_LEFT',
+				required: true,
+				displayOptions: {
+					show: {
+						operation: ['ptz'],
+					},
+				},
+				description: 'The PTZ command to send',
+			},
+			{
+				displayName: 'Preset / Relative Value',
+				name: 'ptzCustomValue',
+				type: 'string',
+				default: '',
+				placeholder: 'preset_door or MOVE_RELATIVE_0.1_-0.2',
+				displayOptions: {
+					show: {
+						operation: ['ptz'],
+						ptzCommand: ['preset', 'relative'],
+					},
+				},
+				description: 'The exact payload to send, e.g. \'preset_door\', \'preset_1\', or \'MOVE_RELATIVE_&lt;pan&gt;_&lt;tilt&gt;\' / \'MOVE_RELATIVE_&lt;pan&gt;_&lt;tilt&gt;_&lt;zoom&gt;\'',
+			},
+
+			// --- Mask name ---
+			{
+				displayName: 'Mask Name',
+				name: 'maskName',
+				type: 'string',
+				default: '',
+				required: true,
+				placeholder: 'driveway_mask',
+				displayOptions: {
+					show: {
+						operation: ['setMotionMask', 'setObjectMask'],
+					},
+				},
+				description: 'The configured mask name',
+			},
+
+			// --- Zone name ---
+			{
+				displayName: 'Zone Name',
+				name: 'zoneName',
+				type: 'string',
+				default: '',
+				required: true,
+				placeholder: 'front_yard',
+				displayOptions: {
+					show: {
+						operation: ['setZone'],
+					},
+				},
+				description: 'The configured zone name',
+			},
+
+			// --- Restart payload (optional) ---
+			{
+				displayName: 'Payload',
+				name: 'restartPayload',
+				type: 'string',
+				default: '',
+				displayOptions: {
+					show: {
+						operation: ['restart'],
+					},
+				},
+				description: 'Optional payload sent with the restart command (any value)',
+			},
+
+			// --- Publish to custom topic ---
+			{
+				displayName: 'Topic',
+				name: 'customTopic',
+				type: 'string',
+				default: '',
+				required: true,
+				placeholder: 'front_door/detect/set',
+				displayOptions: {
+					show: {
+						operation: ['publishCustom', 'getCurrentValue'],
+					},
+				},
+				description: "The bare topic (without the 'frigate/' prefix)",
+			},
+			{
+				displayName: 'Payload',
+				name: 'customPayload',
+				type: 'string',
+				default: '',
+				displayOptions: {
+					show: {
+						operation: ['publishCustom'],
+					},
+				},
+				description:
+					'The payload to publish. JSON strings are sent as-is; scalar strings/numbers are sent bare.',
+			},
+
+			// --- Get current value timeout ---
+			{
+				displayName: 'Timeout (Ms)',
+				name: 'timeoutMs',
+				type: 'number',
+				default: 5000,
+				displayOptions: {
+					show: {
+						operation: ['getCurrentValue'],
+					},
+				},
+				description:
+					'How long to wait for a matching message before returning empty. Retained /state topics usually arrive immediately.',
+			},
+
+			// --- Await state confirmation (shared) ---
+			{
+				displayName: 'Await State Confirmation',
+				name: 'awaitState',
+				type: 'boolean',
+				default: false,
+				displayOptions: {
+					show: {
+						operation: AWAITABLE_OPS,
+					},
+				},
+				description:
+					'Whether to keep the socket open after publishing and wait for the matching /state read-back to confirm the new value',
+			},
+			{
+				displayName: 'Confirmation Timeout (Ms)',
+				name: 'awaitTimeoutMs',
+				type: 'number',
+				default: 5000,
+				displayOptions: {
+					show: {
+						operation: AWAITABLE_OPS,
+						awaitState: [true],
+					},
+				},
+				description: 'How long to wait for the /state read-back before giving up',
+			},
+		],
+	};
+
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+		const items = this.getInputData();
+		const returnData: INodeExecutionData[] = [];
+
+		const credentials = (await this.getCredentials('frigateApi')) as unknown as IFrigateCredentials;
+		const wsUrl = buildWsUrl(credentials);
+
+		for (let i = 0; i < items.length; i++) {
+			try {
+				const operation = this.getNodeParameter('operation', i) as string;
+				const headers = await buildAuthHeaders(this, credentials);
+
+				let json: IDataObject;
+
+				if (operation === 'getCurrentValue') {
+					const topic = this.getNodeParameter('customTopic', i) as string;
+					const timeoutMs = this.getNodeParameter('timeoutMs', i, 5000) as number;
+					const message = await subscribeOnce(wsUrl, headers, topic, timeoutMs);
+					json = {
+						operation,
+						topic,
+						received: message !== undefined,
+						payload: message ? (message.payload as IDataObject) : null,
+						matchedTopic: message ? message.topic : null,
+						raw: message ? message.raw : null,
+					};
+				} else if (operation === 'publishCustom') {
+					const topic = this.getNodeParameter('customTopic', i) as string;
+					const rawPayload = this.getNodeParameter('customPayload', i, '') as string;
+					const payload = coercePayload(rawPayload);
+					await publishEnvelope(wsUrl, headers, topic, payload);
+					json = { operation, topic, payload: payload as IDataObject, published: true };
+				} else {
+					json = await runPublishOperation.call(this, wsUrl, headers, operation, i);
+				}
+
+				returnData.push({ json, pairedItem: { item: i } });
+			} catch (error) {
+				if (this.continueOnFail()) {
+					returnData.push({
+						json: { error: (error as Error).message },
+						pairedItem: { item: i },
+					});
+					continue;
+				}
+				throw error;
+			}
+		}
+
+		return [returnData];
+	}
+}
+
+/**
+ * Resolve the topic + payload for a publish operation, send it, optionally await
+ * the /state read-back, and return the result JSON.
+ */
+async function runPublishOperation(
+	this: IExecuteFunctions,
+	wsUrl: string,
+	headers: IDataObject,
+	operation: string,
+	i: number,
+): Promise<IDataObject> {
+	const meta = OPERATION_META[operation];
+	if (!meta) {
+		throw new NodeOperationError(this.getNode(), `Unknown operation: ${operation}`, { itemIndex: i });
+	}
+
+	const replacements: Record<string, string | undefined> = {};
+
+	// Camera placeholder.
+	if (meta.setTopic.includes('<camera>')) {
+		const camera = this.getNodeParameter('camera', i) as string;
+		if (!camera) {
+			throw new NodeOperationError(this.getNode(), 'Camera is required for this operation.', {
+				itemIndex: i,
+			});
+		}
+		replacements.camera = camera;
+	}
+
+	// Mask / zone name placeholders.
+	if (meta.setTopic.includes('<mask_name>')) {
+		replacements.mask_name = this.getNodeParameter('maskName', i) as string;
+	}
+	if (meta.setTopic.includes('<zone_name>')) {
+		replacements.zone_name = this.getNodeParameter('zoneName', i) as string;
+	}
+
+	const topic = resolveTopicTemplate(meta.setTopic, replacements);
+	const payload = resolvePayload.call(this, operation, i);
+
+	// Restart and PTZ are always fire-and-forget (no read-back).
+	const canAwait = meta.stateTopic !== null;
+	const awaitState = canAwait ? (this.getNodeParameter('awaitState', i, false) as boolean) : false;
+
+	if (awaitState && meta.stateTopic) {
+		const awaitTimeoutMs = this.getNodeParameter('awaitTimeoutMs', i, 5000) as number;
+		const stateTopic = resolveTopicTemplate(meta.stateTopic, replacements);
+		const message = await publishAndAwaitState(
+			wsUrl,
+			headers,
+			topic,
+			payload,
+			stateTopic,
+			awaitTimeoutMs,
+		);
+		return {
+			operation,
+			topic,
+			payload,
+			published: true,
+			confirmed: message !== undefined,
+			stateTopic,
+			stateValue: message ? (message.payload as IDataObject) : null,
+		};
+	}
+
+	await publishEnvelope(wsUrl, headers, topic, payload);
+	return { operation, topic, payload, published: true };
+}
+
+/**
+ * Resolve the payload value for a publish operation based on its parameters.
+ */
+function resolvePayload(this: IExecuteFunctions, operation: string, i: number): string {
+	if (ON_OFF_CAMERA_OPS.includes(operation) || operation === 'setGlobalNotifications') {
+		return this.getNodeParameter('value', i) as string;
+	}
+
+	switch (operation) {
+		case 'setMotionThreshold':
+		case 'setMotionContourArea':
+			return String(this.getNodeParameter('numericValue', i) as number);
+		case 'suspendNotifications':
+			return String(this.getNodeParameter('minutes', i) as number);
+		case 'setBirdseyeMode':
+			return this.getNodeParameter('birdseyeMode', i) as string;
+		case 'ptz': {
+			const command = this.getNodeParameter('ptzCommand', i) as string;
+			if (command === 'preset' || command === 'relative') {
+				const custom = this.getNodeParameter('ptzCustomValue', i, '') as string;
+				if (!custom) {
+					throw new NodeOperationError(
+						this.getNode(),
+						'A preset/relative PTZ value is required for this command.',
+						{ itemIndex: i },
+					);
+				}
+				return custom;
+			}
+			return command;
+		}
+		case 'restart':
+			return this.getNodeParameter('restartPayload', i, '') as string;
+		default:
+			// Mask/zone toggles also use the ON/OFF value field.
+			return this.getNodeParameter('value', i) as string;
+	}
+}
+
+/**
+ * Coerce a free-text custom payload: JSON objects/arrays/numbers are sent
+ * parsed; everything else is sent as a bare string.
+ */
+function coercePayload(rawPayload: string): unknown {
+	if (rawPayload === '') {
+		return '';
+	}
+	return normalizePayload(rawPayload);
+}
