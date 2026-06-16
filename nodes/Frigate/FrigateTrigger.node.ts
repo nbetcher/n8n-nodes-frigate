@@ -16,6 +16,7 @@ import type { IFrigateCredentials, IFrigateMessage } from './GenericFunctions';
 import {
 	buildAuthHeaders,
 	buildWsUrl,
+	FrigateAuthError,
 	parseInboundMessage,
 	resolveTopicTemplate,
 	topicMatches,
@@ -85,7 +86,6 @@ export class FrigateTrigger implements INodeType {
 							'<camera>/<object>/active',
 							'<camera>/all',
 							'<camera>/all/active',
-							'<camera>/<object>/snapshot',
 							'<camera>/audio/<audio_type>',
 							'<camera>/audio/all',
 							'<camera>/audio/dBFS',
@@ -131,7 +131,6 @@ export class FrigateTrigger implements INodeType {
 						event: [
 							'<camera>/<object>',
 							'<camera>/<object>/active',
-							'<camera>/<object>/snapshot',
 							'<zone>/<object>',
 							'<zone>/<object>/active',
 						],
@@ -257,7 +256,15 @@ export class FrigateTrigger implements INodeType {
 			try {
 				headers = await buildAuthHeaders(this, credentials);
 			} catch (error) {
-				this.logger.error(`Frigate Trigger auth failed: ${(error as Error).message}`);
+				if (error instanceof FrigateAuthError) {
+					// Bad/blank credentials will never succeed, so do NOT reconnect —
+					// retrying would hammer /api/login with guaranteed 401s forever.
+					// Stop and surface the error (fails activation; the reconnect timer's
+					// catch logs it and the loop ends).
+					manuallyClosed = true;
+					throw error;
+				}
+				this.logger.error(`Frigate Trigger auth failed (will retry): ${(error as Error).message}`);
 				scheduleReconnect();
 				return;
 			}
@@ -310,7 +317,9 @@ export class FrigateTrigger implements INodeType {
 			const delay = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS);
 			this.logger.debug(`Frigate Trigger reconnecting in ${delay}ms`);
 			reconnectTimer = setTimeout(() => {
-				void connect();
+				void connect().catch((err) => {
+					this.logger.error(`Frigate Trigger reconnect aborted: ${(err as Error).message}`);
+				});
 			}, delay);
 		};
 
@@ -333,7 +342,9 @@ export class FrigateTrigger implements INodeType {
 				const timer = setTimeout(() => {
 					if (settled) return;
 					settled = true;
-					manualWs.close();
+					// terminate() (not close()) to forcibly rip out a socket stuck in a
+					// stalled DNS/TLS handshake rather than politely requesting a close.
+					manualWs.terminate();
 					reject(new Error('Timed out waiting for a matching Frigate event.'));
 				}, MANUAL_TIMEOUT_MS);
 
@@ -353,6 +364,7 @@ export class FrigateTrigger implements INodeType {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timer);
+					manualWs.terminate();
 					reject(err);
 				});
 

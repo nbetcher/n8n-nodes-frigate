@@ -16,7 +16,7 @@ This package is a **community node** that ships `ws` as a runtime dependency (it
 | Piece | Node name (n8n `type`) | Role |
 |---|---|---|
 | **Frigate Trigger** | `frigateTrigger` (group `trigger`) | Starts a workflow when Frigate publishes a matching topic on `/ws`. One persistent WebSocket, auto-reconnect with backoff. |
-| **Frigate** | `frigate` (group `output`/action) | Performs an action: publish a `/set` topic, send a PTZ command, restart, publish a custom topic, or read the current value of a topic. Short-lived socket per execution. |
+| **Frigate** | `frigate` (group `output`/action) | Performs an action: publish a `/set` topic, send a PTZ command, restart, publish a custom topic, or wait for the next value of a topic. Opens one multiplexed `/ws` socket per execution and reuses it across all input items. |
 | **frigateApi** credential | `frigateApi` | Connection + auth for both nodes. |
 
 Both nodes speak Frigate's WebSocket bus at `/ws`. The wire envelope is always exactly `{ "topic": "...", "payload": ... }` with **no `frigate/` prefix** and **no `retain` field** (retain is MQTT-only). Topics you supply must omit `frigate/` — write `events`, `front_door/detect/set`, `restart`.
@@ -31,7 +31,7 @@ Both nodes speak Frigate's WebSocket bus at `/ws`. The wire envelope is always e
 - **Authentication Method** (when auth enabled): `Username & Password (Login for JWT)` (`password`) — logs in to `/api/login` to mint a JWT; or `Bearer / JWT Token` (`token`) — uses a pre-issued JWT directly.
 - **Username** / **Password** (password method) or **Bearer / JWT Token** (token method).
 
-The JWT is sent as both `Authorization: Bearer <jwt>` and a `frigate_token` cookie on the `/ws` upgrade and HTTP calls. The credential's **Test** button hits `GET /api/version`.
+The JWT is sent as both `Authorization: Bearer <jwt>` and a `frigate_token` cookie on the `/ws` upgrade and HTTP calls. The credential's **Test** button performs a real auth check — `POST /api/login` for the password method, an authenticated `GET /api/config` for the token method, `GET /api/version` when auth is disabled — so a wrong password / bad token fails the test.
 
 ## Wiring this up via MCP workflow-building tools
 
@@ -65,13 +65,12 @@ The trigger's `event` value **is** the topic template; blank placeholder fields 
 | `<camera>/<object>/active` | `.../active` | integer active count | camera, object |
 | `<zone>/<object>` | e.g. `driveway/car` | integer count | zone, object |
 | `<camera>/motion` | `front_door/motion` | `'ON'`/`'OFF'` (only non-retained state topic) | camera |
-| `<camera>/<object>/snapshot` | best frame | **binary JPEG** -> base64 in `binary` field | camera, object |
 | `<camera>/audio/<audio_type>` | e.g. `front_door/audio/speech` | `'ON'`/`'OFF'` | camera, audioType |
 | `<camera>/detect/state` | detect read-back | `'ON'`/`'OFF'` (retained) | camera |
 | `<camera>/review_status` | review status | `'NONE'`/`'DETECTION'`/`'ALERT'` | camera |
 | `custom` | any topic/pattern | passthrough | `customTopic` (supports `+` / `#`) |
 
-(46 events total — see `reference/events.md`.)
+(45 events total — see `reference/events.md`.)
 
 ### Action operations (param `operation`) — selected high-value rows
 
@@ -82,7 +81,7 @@ The trigger's `event` value **is** the topic template; blank placeholder fields 
 | `setSnapshots` | `<camera>/snapshots/set` | camera, value | yes |
 | `setMotion` | `<camera>/motion/set` | camera, value | yes |
 | `setEnabled` | `<camera>/enabled/set` | camera, value | yes |
-| `setMotionThreshold` | `<camera>/motion_threshold/set` | camera, numericValue | yes |
+| `setMotionThreshold` | `<camera>/motion_threshold/set` | camera, motionThreshold (int 0–255) | yes |
 | `ptz` | `<camera>/ptz` | camera, ptzCommand (+ptzCustomValue) | **no** (fire-and-forget) |
 | `setPtzAutotracker` | `<camera>/ptz_autotracker/set` | camera, value | yes |
 | `setGlobalNotifications` | `notifications/set` | value | yes |
@@ -93,9 +92,9 @@ The trigger's `event` value **is** the topic template; blank placeholder fields 
 | `setBirdseyeMode` | `<camera>/birdseye_mode/set` | camera, birdseyeMode(CONTINUOUS/MOTION/OBJECTS) | yes |
 | `restart` | `restart` | restartPayload(optional) | **no** |
 | `publishCustom` | any | customTopic, customPayload | — |
-| `getCurrentValue` | any (subscribe once) | customTopic, timeoutMs | reads one msg |
+| `getCurrentValue` (Wait for Next Topic Value) | any (subscribe once) | customTopic, timeoutMs | waits for NEXT broadcast |
 
-Toggle ops expose an optional **Await State Confirmation** (`awaitState` + `awaitTimeoutMs`) that keeps the socket open until the `/state` read-back confirms the change. `ptz` and `restart` have no read-back. (27 operations total — see `reference/actions.md`.)
+Toggle ops expose an optional **Await State Confirmation** (`awaitState` + `awaitTimeoutMs`, 0–600000 ms) that keeps the socket open for the `/state` read-back. The awaited result returns both `received` (a `/state` frame arrived) and `confirmed` (that frame's value actually **matches** the requested value, with string/number tolerance) — so a frame can arrive without confirming. `ptz`, `restart`, `setAudioTranscription`, and `suspendNotifications` have no read-back. (27 operations total — see `reference/actions.md`.)
 
 ## Canonical workflow recipes (trigger -> branch -> act)
 
@@ -114,12 +113,14 @@ Because the `events` feed fires on `new`, `update`, and `end`, **always filter o
 ## Common pitfalls
 
 - **Filter the `events`/`reviews` feed.** They fire on `new`/`update`/`end`. Without a `type === "new"` filter you act repeatedly. Reviews also escalate `detection -> alert`; gate on `payload.after.severity` if you only want alerts.
-- **Double-parse is already done.** The trigger parses the outer envelope and the nested JSON string, so `$json.payload` for structured topics is a real object — do not `JSON.parse` it again. Scalar topics give a string/number; the snapshot topic gives base64 in `$json.binary` (not `payload`).
+- **Double-parse is already done.** The trigger parses the outer envelope and the nested JSON string, so `$json.payload` for structured topics is a real object — do not `JSON.parse` it again. Scalar topics give a string/number.
+- **No snapshots over `/ws`.** Frigate publishes snapshot JPEG bytes **only over MQTT** — its `/ws` communicator JSON-serializes every envelope and silently drops binary payloads, so the per-object snapshot topic is unreachable over `/ws` on every Frigate version. To get a snapshot image, use MQTT or the HTTP API (`/api/events/<id>/snapshot.jpg`, `/api/<camera>/<label>/snapshot.jpg`) via n8n's HTTP Request node.
 - **No `frigate/` prefix, ever.** Over `/ws` topics omit it. Write `front_door/detect/set`, not `frigate/front_door/detect/set`.
 - **`ws` vs `wss` follows Protocol.** `http` -> `ws://`, `https` -> `wss://`. Port `5000` is unauthenticated (Auth Enabled off); port `8971` is authenticated (Auth Enabled on). Mixing wss with port 5000, or sending no auth to 8971, fails the handshake.
 - **JWT/auth.** Password method logs in to `/api/login` each connect and on 401; a stale pre-issued bearer token will eventually 401 — prefer the password method for long-lived triggers. If the credential Test (`GET /api/version`) passes but `/ws` fails, the WebSocket upgrade is being blocked by a proxy — check the Path Prefix and that the proxy forwards `Upgrade` headers.
+- **Actions need an admin identity.** Mutating (action) operations require an **admin-capable** Frigate identity. On Frigate ≤ 0.17.x `/ws` enforces **no** per-message write authorization (any connection that can reach `/ws` can publish `set`/command topics); on Frigate 0.18+ a viewer/non-admin role's writes to command topics are **silently dropped server-side** with no error returned. Because `/ws` returns no write acknowledgement either way, verify mutations with **Await State Confirmation** (now value-checked) or the HTTP API, and use an admin user/token.
 - **Camera / zone / object are placeholders.** Substitute real configured names. On the trigger, leaving a placeholder blank makes it a `+` wildcard (all cameras/objects/zones); on the action node `camera` is **required** and must be a real camera.
-- **Retained vs non-retained.** `/state` read-backs and `available` are retained (MQTT) — but over `/ws` you only see them when they're (re)published, so `getCurrentValue` may time out if nothing has changed since connect. `<camera>/motion` is the one non-retained state topic. PTZ and restart publish nothing back.
+- **Retained vs non-retained.** `/state` read-backs and `available` are retained (MQTT) — but `/ws` does **not** replay current/retained state, so **Wait for Next Topic Value** (`getCurrentValue`) only returns when the topic is *next* (re)published and will time out on a quiet topic even though the state exists. `<camera>/motion` is the one non-retained state topic. PTZ and restart publish nothing back.
 - **Keep the trigger alive.** The trigger holds one persistent socket and reconnects with backoff (5s -> 60s cap) across Frigate restarts/network drops. Don't add a second always-on trigger to the same instance unnecessarily. The in-editor "listen for test event" opens a short-lived socket with a 30s timeout and needs a matching event to actually fire during that window.
 - **Zones are addressed by zone name, not camera-prefixed**, in the count topics (`<zone>/<object>`). But the **Set Zone action** toggles a zone *on a camera* (`<camera>/zone/<zone_name>/set`).
 - **Birdseye is per-camera** — there is no global birdseye topic. Disabling motion fails while detect is enabled. Enabling detect also enables motion.

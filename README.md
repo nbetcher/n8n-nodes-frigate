@@ -36,8 +36,8 @@ Frigate bridges its MQTT command and feed topics onto a public WebSocket endpoin
 ## Features
 
 - **Persistent trigger** — one always-on WebSocket per trigger node, with automatic exponential-backoff reconnect (5 s → 60 s cap) so workflows survive Frigate restarts and network drops.
-- **46 catalogued trigger events** — every documented `/ws` topic, from tracked-object lifecycle and review items to per-camera/per-zone object counts, audio metrics, GenAI results, and every retained `/state` read-back. Plus a catch-all **Subscribe to Custom Topic** option.
-- **27 action operations** — toggle detect / recordings / snapshots / audio / motion, set thresholds, control birdseye, send PTZ commands, manage notifications, toggle masks/zones, restart Frigate, publish to any custom topic, and read the current value of any topic on demand.
+- **45 catalogued trigger events** — every documented `/ws` topic, from tracked-object lifecycle and review items to per-camera/per-zone object counts, audio metrics, GenAI results, and every retained `/state` read-back. Plus a catch-all **Subscribe to Custom Topic** option.
+- **27 action operations** — toggle detect / recordings / snapshots / audio / motion, set thresholds, control birdseye, send PTZ commands, manage notifications, toggle masks/zones, restart Frigate, publish to any custom topic, and wait for the next value of any topic.
 - **Client-side wildcard subscriptions** — leave a placeholder field blank to subscribe to all cameras / zones / objects at once (MQTT-style `+`), or supply raw `+` / `#` patterns.
 - **Optional state confirmation** — every setter with a `/state` read-back can optionally keep the socket open and wait for the confirming message after publishing.
 - **Flexible auth** — connect unauthenticated to the internal port, or authenticate against an exposed instance with username/password (auto-login for a JWT) or a pre-issued bearer token.
@@ -51,7 +51,7 @@ The `/ws` wire format is a JSON envelope with exactly two fields:
 { "topic": "front_door/person", "payload": "1" }
 ```
 
-There is **no** `retain` field on the wire — retention is an MQTT-only concept. Topics omit the `frigate/` prefix. For structured topics (events, reviews, stats, ...) the `payload` is itself a **JSON-encoded string** nested inside the envelope, so the node parses it a second time. Scalar payloads (`ON`/`OFF`, integers, dBFS values) pass through unchanged. The best-snapshot topic delivers raw JPEG bytes, which the node emits as a base64 string.
+There is **no** `retain` field on the wire — retention is an MQTT-only concept. Topics omit the `frigate/` prefix. For structured topics (events, reviews, stats, ...) the `payload` is itself a **JSON-encoded string** nested inside the envelope, so the node parses it a second time. Scalar payloads (`ON`/`OFF`, integers, dBFS values) pass through unchanged. Frigate's `/ws` communicator JSON-serializes every envelope and silently drops binary payloads, so snapshot JPEG bytes never arrive over `/ws` — they are published only over MQTT (use MQTT or the HTTP API to fetch images).
 
 Because `/ws` broadcasts **all** topics with no server-side per-topic subscribe, the trigger node filters the incoming stream **client-side** by matching each message's `topic` against your resolved subscription pattern (supporting `+` single-level and `#` multi-level wildcards).
 
@@ -103,7 +103,16 @@ Create a single **Frigate API** credential (internal name `frigateApi`). Fields:
 | **Password** | `password` | string (masked) | _(empty)_ | _Shown for password auth._ Used to obtain a JWT via `/api/login`; the JWT is then sent as a cookie / `Authorization` header. |
 | **Bearer / JWT Token** | `token` | string (masked) | _(empty)_ | _Shown for token auth._ A pre-issued JWT, sent as `Authorization: Bearer <jwt>` (and as the `frigate_token` cookie). |
 
-**How auth is applied.** When auth is disabled, the node opens `/ws` and calls `/api` with no credentials. With password auth, the node first `POST`s `{ user, password }` to `${base}/api/login`, extracts the JWT (from the response body or the `frigate_token` Set-Cookie), and sends it as both an `Authorization: Bearer` header and a `frigate_token` cookie on the `/ws` upgrade. With token auth it uses your JWT directly. The credential's **Test** button performs `GET /api/version`, which works with or without auth.
+**How auth is applied.** When auth is disabled, the node opens `/ws` and calls `/api` with no credentials. With password auth, the node first `POST`s `{ user, password }` to `${base}/api/login`, extracts the JWT (from the response body or the `frigate_token` Set-Cookie), and sends it as both an `Authorization: Bearer` header and a `frigate_token` cookie on the `/ws` upgrade. With token auth it uses your JWT directly. The credential's **Test** button performs a **real auth check**: `POST /api/login` for the username/password method, and an authenticated `GET /api/config` for the token method (when auth is disabled it falls back to `GET /api/version`). A wrong password or bad/expired token therefore **fails** the test rather than showing a false-positive green.
+
+### Write access for actions (admin role required)
+
+Action (mutating) operations require an **admin-capable** Frigate identity. The catch is that **`/ws` returns no write acknowledgement**, and write-authorization behaves differently per version:
+
+- On Frigate **≤ 0.17.x**, `/ws` enforces **no per-message write authorization** — any connection that can reach `/ws` may publish `set`/command topics.
+- On Frigate **0.18+**, a viewer/non-admin role's writes to command topics are **silently dropped server-side**, with no error returned to the client.
+
+Because neither case sends back a write ack, use an **admin** user/token for actions, and verify mutations with **Await State Confirmation** (now value-checked) or via the HTTP API.
 
 ## Frigate Trigger Node
 
@@ -117,10 +126,11 @@ The trigger node opens **one persistent WebSocket** to `/ws` and starts the work
 {
   "topic": "front_door/person",
   "payload": 1,
-  "raw": "{\"topic\":\"front_door/person\",\"payload\":\"1\"}",
-  "binary": "<base64 — only present for snapshot frames>"
+  "raw": "{\"topic\":\"front_door/person\",\"payload\":\"1\"}"
 }
 ```
+
+> **Snapshots are not available over `/ws`.** Frigate publishes snapshot bytes **only over MQTT** — its `/ws` communicator JSON-serializes every envelope and silently drops binary payloads, so the per-object snapshot is unreachable over `/ws` on every Frigate version. To get a snapshot image, use MQTT or the HTTP API (`/api/events/<id>/snapshot.jpg`, `/api/<camera>/<label>/snapshot.jpg`).
 
 ### Trigger Event Catalog
 
@@ -144,7 +154,6 @@ Topics below are shown **without** the `frigate/` prefix. Placeholders (`<camera
 | Active Object Count - Zone | `<zone>/<object>/active` | Active count of an object type in a zone changes. | Scalar integer. |
 | All Object Count - Zone | `<zone>/all` | Total object count in a zone changes. | Scalar integer. |
 | All Active Object Count - Zone | `<zone>/all/active` | Total active object count in a zone changes. | Scalar integer. |
-| Best Snapshot Image | `<camera>/<object>/snapshot` | Frigate captures the best/highest-confidence frame for an object type. | Binary JPEG bytes — emitted as a base64 string in the `binary` field (not JSON). |
 | Audio Type Detected | `<camera>/audio/<audio_type>` | A specific audio type (speech, bark, scream, …) detected or cleared. | Scalar string: `ON` or `OFF`. |
 | Any Audio Detected | `<camera>/audio/all` | Any monitored audio type detected or cleared. | Scalar string: `ON` or `OFF`. |
 | Audio Level dBFS | `<camera>/audio/dBFS` | Audio level metric published. | Scalar numeric (dBFS). |
@@ -173,13 +182,13 @@ Topics below are shown **without** the `frigate/` prefix. Placeholders (`<camera
 | Camera/Role Status | `<camera>/status/<role>` | Stream/role state change (e.g. `detect`, `record` roles). | Scalar string: `online` \| `offline` \| `disabled`. |
 | Review Status | `<camera>/review_status` | Current review status of the camera. | Scalar string: `NONE` \| `DETECTION` \| `ALERT`. |
 | Classification Model Result | `<camera>/classification/<model_name>` | Custom state-classification model result changed (0.16+). | Scalar string: predicted class name. |
-| Subscribe to Custom Topic | _any_ | Catch-all. Subscribe to any `/ws` topic by exact string or `+`/`#` wildcard pattern (filtered client-side). | Passthrough: JSON parsed when possible, scalars passed through, binary as base64. |
+| Subscribe to Custom Topic | _any_ | Catch-all. Subscribe to any `/ws` topic by exact string or `+`/`#` wildcard pattern (filtered client-side). | Passthrough: JSON parsed when possible, scalars passed through. |
 
 ## Frigate Action Node
 
-The **Frigate** action node publishes commands over a short-lived `/ws` connection. Pick an **Operation**, fill its parameters, and the node sends `JSON.stringify({ topic, payload })` once, then closes the socket.
+The **Frigate** action node opens **one multiplexed `/ws` connection per execution**, reuses it across every input item, and closes it once at the end. Pick an **Operation**, fill its parameters, and the node sends `JSON.stringify({ topic, payload })` for each item.
 
-By default actions are **fire-and-forget** — `/ws` has no application-level ack. Every operation that has a `/state` read-back (i.e. everything except **PTZ Command**, **Set Audio Transcription**, and **Restart**) exposes an optional **Await State Confirmation** toggle. When on, the node keeps the socket open after publishing and waits (up to **Confirmation Timeout**, default 5000 ms) for the matching `/state` message, returning it as `stateValue` with `confirmed: true`.
+By default actions are **fire-and-forget** — `/ws` has no application-level ack. Every operation that has a `/state` read-back (i.e. everything except **PTZ Command**, **Set Audio Transcription**, **Suspend Per-Camera Notifications**, and **Restart**) exposes an optional **Await State Confirmation** toggle. When on, the node keeps the socket open after publishing and waits (up to **Confirmation Timeout**, default 5000 ms, range 0–600000 ms) for the matching `/state` message, returning it as `stateValue`. The result then carries two distinct flags: **`received`** is `true` when a `/state` read-back frame arrived at all, and **`confirmed`** is `true` only when that frame's value actually **matches** the value you requested (compared with string/number tolerance, so `'ON'` vs `on` or `30` vs `'30'` still match). A frame can arrive (`received: true`) reporting a different/concurrent value, in which case `confirmed` is `false`.
 
 ### Action Operation Catalog
 
@@ -194,15 +203,15 @@ Topics shown **without** the `frigate/` prefix. `value` is the `ON`/`OFF` option
 | Set Motion Detection | `<camera>/motion/set` | `camera`, `value` | Turn motion detection on/off. Cannot disable while detect is enabled. Read-back `…/motion/state`. |
 | Set Improve Contrast | `<camera>/improve_contrast/set` | `camera`, `value` | Turn contrast improvement for motion on/off. Read-back `…/improve_contrast/state`. |
 | Set Camera Enabled | `<camera>/enabled/set` | `camera`, `value` | Turn whole-camera processing on/off. Requires `enabled` present in config. Read-back `…/enabled/state`. |
-| Set Motion Threshold | `<camera>/motion_threshold/set` | `camera`, `numericValue` (int) | Set how much a pixel must change to count as motion. Read-back `…/motion_threshold/state`. |
-| Set Motion Contour Area | `<camera>/motion_contour_area/set` | `camera`, `numericValue` (int) | Set the minimum contour size counted as motion. Read-back `…/motion_contour_area/state`. |
+| Set Motion Threshold | `<camera>/motion_threshold/set` | `camera`, `motionThreshold` (int, 0–255) | Set how much a pixel must change to count as motion. Read-back `…/motion_threshold/state`. |
+| Set Motion Contour Area | `<camera>/motion_contour_area/set` | `camera`, `motionContourArea` (int, 0–10000) | Set the minimum contour size counted as motion. Read-back `…/motion_contour_area/state`. |
 | Set Birdseye (Camera) | `<camera>/birdseye/set` | `camera`, `value` | Include/exclude this camera in birdseye (per-camera; no global topic). Read-back `…/birdseye/state`. |
 | Set Birdseye Mode | `<camera>/birdseye_mode/set` | `camera`, `birdseyeMode` (CONTINUOUS/MOTION/OBJECTS) | Set when the camera appears in birdseye. Read-back `…/birdseye_mode/state`. |
 | PTZ Command | `<camera>/ptz` | `camera`, `ptzCommand` (+ `ptzCustomValue` for preset/relative) | Send a PTZ command to an ONVIF camera. **Fire-and-forget, no read-back.** Requires `onvif` configured. |
 | Set PTZ Autotracker | `<camera>/ptz_autotracker/set` | `camera`, `value` | Turn PTZ autotracking on/off. Requires `ptz_autotracker` in config. Read-back `…/ptz_autotracker/state`. |
 | Set Global Notifications | `notifications/set` | `value` | Enable/disable notifications for **all** cameras. Read-back `notifications/state`. |
 | Set Per-Camera Notifications | `<camera>/notifications/set` | `camera`, `value` | Turn per-camera notifications on/off. Read-back `…/notifications/state`. |
-| Suspend Per-Camera Notifications | `<camera>/notifications/suspend` | `camera`, `minutes` (int) | Suspend a camera's notifications for N minutes. Read-back `…/notifications/suspended`. |
+| Suspend Per-Camera Notifications | `<camera>/notifications/suspend` | `camera`, `minutes` (int, 0–10080) | Suspend a camera's notifications for N minutes. Read-back `…/notifications/suspended`. |
 | Set Audio Transcription | `<camera>/audio_transcription/set` | `camera`, `value` | Turn live audio transcription on/off (0.16+). Requires audio + transcription in config. **No read-back.** |
 | Set Review Alerts | `<camera>/review_alerts/set` | `camera`, `value` | Turn generation of `alert` review items on/off (0.16+). Read-back `…/review_alerts/state`. |
 | Set Review Detections | `<camera>/review_detections/set` | `camera`, `value` | Turn generation of `detection` review items on/off (0.16+). Read-back `…/review_detections/state`. |
@@ -213,7 +222,7 @@ Topics shown **without** the `frigate/` prefix. `value` is the `ON`/`OFF` option
 | Set Zone | `<camera>/zone/<zone_name>/set` | `camera`, `zoneName`, `value` | Enable/disable a named zone. Read-back `…/zone/<zone_name>/state`. |
 | Restart | `restart` | `restartPayload` (optional) | Cause Frigate to exit so Docker restarts the container. **No read-back.** |
 | Publish to Custom Topic | _any_ | `customTopic`, `customPayload` | Publish an arbitrary `{ topic, payload }` envelope. Topic is sent bare. JSON strings parsed; scalars sent as-is. |
-| Get Current Value | _any_ | `customTopic`, `timeoutMs` (default 5000) | Open `/ws`, return the next message matching the topic, then close. Ideal for reading retained `/state` read-backs on demand. |
+| Wait for Next Topic Value | _any_ | `customTopic`, `timeoutMs` (default 5000, range 0–600000) | Open `/ws` and return the **next** broadcast of a topic, then close. Frigate `/ws` does **not** replay current/retained state — a `/state` value only arrives when it next changes, so a quiet topic can time out even though the state exists. |
 
 **PTZ commands.** The `ptzCommand` field offers `MOVE_UP/DOWN/LEFT/RIGHT`, `ZOOM_IN/OUT`, `STOP`, `FOCUS_IN/OUT`, `INIT`, plus **Preset** and **Relative Move** options. For the latter two, fill the **Preset / Relative Value** override with the exact payload, e.g. `preset_door`, `preset_1`, or `MOVE_RELATIVE_0.1_-0.2` (underscore-separated floats; optional trailing zoom: `MOVE_RELATIVE_<pan>_<tilt>_<zoom>`).
 
@@ -234,7 +243,7 @@ Notify yourself the moment a person is confirmed on the front door camera.
    - Message: `Person detected on {{$json.payload.after.camera}} (score {{$json.payload.after.top_score}}).`
    - Optionally embed the snapshot: build the URL `http://<host>:5000/api/events/{{$json.payload.after.id}}/snapshot.jpg` and attach it.
 
-> Tip: to get the actual JPEG over `/ws` instead of HTTP, add a second **Frigate Trigger** on `Best Snapshot Image` (`<camera>/<object>/snapshot`) with Camera `front_door`, Object `person` — its `binary` field is the base64 image.
+> Tip: snapshots are **not** delivered over `/ws` (Frigate sends snapshot bytes only over MQTT). Fetch the image over the HTTP API instead — by event id (`/api/events/<id>/snapshot.jpg`) or the latest best snapshot for a label (`/api/<camera>/<label>/snapshot.jpg`) — using n8n's HTTP Request node.
 
 ### 2. Toggle recording on a schedule
 
@@ -271,18 +280,18 @@ Swing an ONVIF PTZ camera to a preset whenever a car enters the driveway, then r
 
 ## Payload Handling
 
-- **Inbound (trigger):** structured topics arrive as a JSON-encoded string nested in the envelope and are parsed a second time, so `payload` is a ready-to-use object. Scalar topics (`ON`/`OFF`, integers, dBFS) pass through. The snapshot topic's raw JPEG is emitted as base64 in `binary`. The original envelope string is always available in `raw`.
+- **Inbound (trigger):** structured topics arrive as a JSON-encoded string nested in the envelope and are parsed a second time, so `payload` is a ready-to-use object. Scalar topics (`ON`/`OFF`, integers, dBFS) pass through. The original envelope string is always available in `raw`. (Snapshot JPEG bytes are not delivered over `/ws` — Frigate publishes them only over MQTT; use the HTTP API for images.)
 - **Outbound (action):** `ON`/`OFF`, numbers, minutes, and PTZ commands are sent as bare strings. For **Publish to Custom Topic**, a value that looks like JSON (`{…}` or `[…]`) is parsed and embedded as structured data; everything else is sent as a string.
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| **Trigger never fires** | Confirm the topic actually publishes — add a temporary **Subscribe to Custom Topic** trigger with pattern `#` to see everything, or use the action node's **Get Current Value** on a `/state` topic. Remember: `count`/`state` topics only fire on **change**. |
+| **Trigger never fires** | Confirm the topic actually publishes — add a temporary **Subscribe to Custom Topic** trigger with pattern `#` to see everything, or use the action node's **Wait for Next Topic Value** on a `/state` topic. Remember: `count`/`state` topics only fire on **change**. |
 | **`Listen for test event` times out (30 s)** | No matching message was published within the window. Trigger the event in real life (walk past the camera) or widen your pattern (blank placeholders → `+`). |
 | **Connection refused / handshake timeout** | Wrong **Host**/**Port**, or the reverse proxy isn't forwarding the WebSocket upgrade. Verify `ws://<host>:<port>/ws` is reachable from the n8n host. Set **Path Prefix** if Frigate is under a sub-path. |
 | **401 / login fails** | With **Frigate Auth Enabled**, check username/password (the default `admin` password is printed to Frigate's logs on first start) or that your bearer JWT is valid and unexpired. Port `8971` requires auth; port `5000` does not. |
-| **Credential `Test` passes but the socket won't open** | `Test` only hits `GET /api/version` over HTTP. The `/ws` upgrade can still fail behind a proxy that strips `Upgrade`/`Connection` headers — fix the proxy WebSocket config. |
+| **Credential `Test` passes but the socket won't open** | `Test` does a real HTTP auth check (`POST /api/login` / authenticated `GET /api/config`), but the `/ws` upgrade can still fail behind a proxy that strips `Upgrade`/`Connection` headers — fix the proxy WebSocket config. |
 | **Action publishes but nothing changes** | The feature may be disabled in Frigate's config (e.g. recordings/audio/onvif must be enabled). Some setters are no-ops without the corresponding config block. Turn on **Await State Confirmation** to see whether the `/state` read-back changes. |
 | **`A preset/relative PTZ value is required`** | You chose **Preset** or **Relative Move** but left **Preset / Relative Value** blank. Fill it (e.g. `preset_door`). |
 | **Wrong port** | `5000` = internal unauthenticated. `8971` = authenticated. Using `8971` without enabling auth, or `5000` with auth on, will fail. |

@@ -1,6 +1,9 @@
 import type {
+	ICredentialsDecrypted,
+	ICredentialTestFunctions,
 	IDataObject,
 	IExecuteFunctions,
+	INodeCredentialTestResult,
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
@@ -15,12 +18,11 @@ import {
 import type { IFrigateCredentials } from './GenericFunctions';
 import {
 	buildAuthHeaders,
+	buildHttpBase,
 	buildWsUrl,
+	FrigateWsSession,
 	normalizePayload,
-	publishAndAwaitState,
-	publishEnvelope,
 	resolveTopicTemplate,
-	subscribeOnce,
 } from './GenericFunctions';
 
 /**
@@ -149,6 +151,7 @@ export class Frigate implements INodeType {
 			{
 				name: 'frigateApi',
 				required: true,
+				testedBy: 'frigateApiTest',
 			},
 		],
 		properties: [
@@ -316,10 +319,11 @@ export class Frigate implements INodeType {
 						description: 'Publish an arbitrary { topic, payload } envelope over /ws',
 					},
 					{
-						name: 'Get Current Value',
+						name: 'Wait for Next Topic Value',
 						value: 'getCurrentValue',
-						action: 'Get the current value of a topic',
-						description: 'Subscribe once and return the next value of a topic',
+						action: 'Wait for the next value of a topic',
+						description:
+							'Open the socket and return the NEXT broadcast of a topic. Frigate /ws does not replay current/retained state, so a /state value only arrives when it next changes — on a quiet system this can time out even though the state exists.',
 					},
 				],
 				default: 'setDetect',
@@ -402,19 +406,42 @@ export class Frigate implements INodeType {
 				description: 'Whether to turn the feature on or off',
 			},
 
-			// --- Numeric value (threshold / contour area) ---
+			// --- Motion threshold (0..255) ---
 			{
-				displayName: 'Value',
-				name: 'numericValue',
+				displayName: 'Threshold',
+				name: 'motionThreshold',
 				type: 'number',
 				default: 30,
 				required: true,
+				typeOptions: {
+					minValue: 0,
+					maxValue: 255,
+				},
 				displayOptions: {
 					show: {
-						operation: ['setMotionThreshold', 'setMotionContourArea'],
+						operation: ['setMotionThreshold'],
 					},
 				},
-				description: 'The integer value to set',
+				description: 'Motion sensitivity threshold (integer 0-255; Frigate default is 30)',
+			},
+
+			// --- Motion contour area (0..10000) ---
+			{
+				displayName: 'Contour Area',
+				name: 'motionContourArea',
+				type: 'number',
+				default: 10,
+				required: true,
+				typeOptions: {
+					minValue: 0,
+					maxValue: 10000,
+				},
+				displayOptions: {
+					show: {
+						operation: ['setMotionContourArea'],
+					},
+				},
+				description: 'Minimum contour size counted as motion (integer 0-10000; Frigate default is 10)',
 			},
 
 			// --- Minutes (suspend notifications) ---
@@ -424,12 +451,16 @@ export class Frigate implements INodeType {
 				type: 'number',
 				default: 30,
 				required: true,
+				typeOptions: {
+					minValue: 0,
+					maxValue: 10080,
+				},
 				displayOptions: {
 					show: {
 						operation: ['suspendNotifications'],
 					},
 				},
-				description: 'Number of minutes to suspend notifications for',
+				description: 'Number of minutes to suspend notifications for (0-10080)',
 			},
 
 			// --- Birdseye mode ---
@@ -562,13 +593,17 @@ export class Frigate implements INodeType {
 				name: 'timeoutMs',
 				type: 'number',
 				default: 5000,
+				typeOptions: {
+					minValue: 0,
+					maxValue: 600000,
+				},
 				displayOptions: {
 					show: {
 						operation: ['getCurrentValue'],
 					},
 				},
 				description:
-					'How long to wait for a matching message before returning empty. Retained /state topics usually arrive immediately.',
+					'How long to wait for the next matching broadcast before returning empty (0-600000 ms). Note: /ws does not replay current state — the value only arrives when Frigate next publishes the topic.',
 			},
 
 			// --- Await state confirmation (shared) ---
@@ -590,15 +625,74 @@ export class Frigate implements INodeType {
 				name: 'awaitTimeoutMs',
 				type: 'number',
 				default: 5000,
+				typeOptions: {
+					minValue: 0,
+					maxValue: 600000,
+				},
 				displayOptions: {
 					show: {
 						operation: AWAITABLE_OPS,
 						awaitState: [true],
 					},
 				},
-				description: 'How long to wait for the /state read-back before giving up',
+				description: 'How long to wait for the /state read-back before giving up (0-600000 ms)',
 			},
 		],
+	};
+
+	// Programmatic credential test: actually exercises the configured auth path
+	// (a real /api/login for the password method, an authenticated /api/config
+	// for the token method) instead of an auth-agnostic /api/version probe, so a
+	// wrong password / bad token fails the test instead of showing a false green.
+	methods = {
+		credentialTest: {
+			async frigateApiTest(
+				this: ICredentialTestFunctions,
+				credential: ICredentialsDecrypted,
+			): Promise<INodeCredentialTestResult> {
+				const c = (credential.data ?? {}) as unknown as IFrigateCredentials;
+				const base = buildHttpBase(c);
+				try {
+					if (c.authEnabled) {
+						if (c.authMethod === 'token') {
+							if (!c.token) {
+								return {
+									status: 'Error',
+									message: 'Auth is enabled (Bearer/JWT) but no token was provided.',
+								};
+							}
+							await this.helpers.request({
+								method: 'GET',
+								uri: `${base}/api/config`,
+								headers: { Authorization: `Bearer ${c.token}` },
+								json: true,
+							});
+						} else {
+							if (!c.username || !c.password) {
+								return {
+									status: 'Error',
+									message: 'Auth is enabled (username/password) but a field is empty.',
+								};
+							}
+							await this.helpers.request({
+								method: 'POST',
+								uri: `${base}/api/login`,
+								body: { user: c.username, password: c.password },
+								json: true,
+							});
+						}
+					} else {
+						await this.helpers.request({ method: 'GET', uri: `${base}/api/version` });
+					}
+					return { status: 'OK', message: 'Connection successful' };
+				} catch (error) {
+					return {
+						status: 'Error',
+						message: `Frigate connection failed: ${(error as Error).message}`,
+					};
+				}
+			},
+		},
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
@@ -608,68 +702,81 @@ export class Frigate implements INodeType {
 		const credentials = (await this.getCredentials('frigateApi')) as unknown as IFrigateCredentials;
 		const wsUrl = buildWsUrl(credentials);
 
-		// Auth headers depend only on the credential, not on the item, so resolve
-		// them once (a password login is a full HTTP round-trip) and reuse them for
-		// every item instead of logging in per item.
-		let headers: IDataObject | undefined;
+		// Resolve auth ONCE for the whole batch. A failure here is a credential
+		// problem (not per-item), so capture it and short-circuit every item rather
+		// than re-hitting /api/login for each one (which would hammer Frigate).
+		let headers: IDataObject = {};
+		let authError: Error | undefined;
+		try {
+			headers = await buildAuthHeaders(this, credentials);
+		} catch (error) {
+			authError = error as Error;
+		}
 
-		for (let i = 0; i < items.length; i++) {
-			try {
-				const operation = this.getNodeParameter('operation', i) as string;
-				if (headers === undefined) {
-					headers = await buildAuthHeaders(this, credentials);
-				}
+		// One multiplexed /ws socket for the whole execution, closed once at the end
+		// (avoids a new connection + teardown per item, and the publish/close race).
+		const session = new FrigateWsSession(wsUrl, headers);
 
-				const item: INodeExecutionData = { json: {}, pairedItem: { item: i } };
-
-				if (operation === 'getCurrentValue') {
-					const topic = this.getNodeParameter('customTopic', i) as string;
-					if (!topic) {
-						throw new NodeOperationError(this.getNode(), 'Topic is required.', { itemIndex: i });
+		try {
+			for (let i = 0; i < items.length; i++) {
+				try {
+					if (authError) {
+						throw authError;
 					}
-					const timeoutMs = this.getNodeParameter('timeoutMs', i, 5000) as number;
-					const message = await subscribeOnce(wsUrl, headers, topic, timeoutMs);
-					item.json = {
-						operation,
-						topic,
-						received: message !== undefined,
-						payload: message ? (message.payload as IDataObject) : null,
-						matchedTopic: message ? message.topic : null,
-						raw: message ? message.raw : null,
-					};
-					if (message?.binary !== undefined) {
-						item.binary = {
-							data: await this.helpers.prepareBinaryData(
-								Buffer.from(message.binary, 'base64'),
-								'snapshot.jpg',
-								'image/jpeg',
-							),
+					const operation = this.getNodeParameter('operation', i) as string;
+					const item: INodeExecutionData = { json: {}, pairedItem: { item: i } };
+
+					if (operation === 'getCurrentValue') {
+						const topic = this.getNodeParameter('customTopic', i) as string;
+						if (!topic) {
+							throw new NodeOperationError(this.getNode(), 'Topic is required.', { itemIndex: i });
+						}
+						const timeoutMs = clampTimeoutMs(this.getNodeParameter('timeoutMs', i, 5000) as number);
+						const message = await session.subscribeOnce(topic, timeoutMs);
+						item.json = {
+							operation,
+							topic,
+							received: message !== undefined,
+							payload: message ? (message.payload as IDataObject) : null,
+							matchedTopic: message ? message.topic : null,
+							raw: message ? message.raw : null,
 						};
+						if (message?.binary !== undefined) {
+							item.binary = {
+								data: await this.helpers.prepareBinaryData(
+									Buffer.from(message.binary, 'base64'),
+									'snapshot.jpg',
+									'image/jpeg',
+								),
+							};
+						}
+					} else if (operation === 'publishCustom') {
+						const topic = this.getNodeParameter('customTopic', i) as string;
+						if (!topic) {
+							throw new NodeOperationError(this.getNode(), 'Topic is required.', { itemIndex: i });
+						}
+						const rawPayload = this.getNodeParameter('customPayload', i, '') as string;
+						const payload = coercePayload(rawPayload);
+						await session.publish(topic, payload);
+						item.json = { operation, topic, payload: payload as IDataObject, published: true };
+					} else {
+						item.json = await runPublishOperation.call(this, session, operation, i);
 					}
-				} else if (operation === 'publishCustom') {
-					const topic = this.getNodeParameter('customTopic', i) as string;
-					if (!topic) {
-						throw new NodeOperationError(this.getNode(), 'Topic is required.', { itemIndex: i });
-					}
-					const rawPayload = this.getNodeParameter('customPayload', i, '') as string;
-					const payload = coercePayload(rawPayload);
-					await publishEnvelope(wsUrl, headers, topic, payload);
-					item.json = { operation, topic, payload: payload as IDataObject, published: true };
-				} else {
-					item.json = await runPublishOperation.call(this, wsUrl, headers, operation, i);
-				}
 
-				returnData.push(item);
-			} catch (error) {
-				if (this.continueOnFail()) {
-					returnData.push({
-						json: { error: (error as Error).message },
-						pairedItem: { item: i },
-					});
-					continue;
+					returnData.push(item);
+				} catch (error) {
+					if (this.continueOnFail()) {
+						returnData.push({
+							json: { error: (error as Error).message },
+							pairedItem: { item: i },
+						});
+						continue;
+					}
+					throw error;
 				}
-				throw error;
 			}
+		} finally {
+			await session.close();
 		}
 
 		return [returnData];
@@ -682,8 +789,7 @@ export class Frigate implements INodeType {
  */
 async function runPublishOperation(
 	this: IExecuteFunctions,
-	wsUrl: string,
-	headers: IDataObject,
+	session: FrigateWsSession,
 	operation: string,
 	i: number,
 ): Promise<IDataObject> {
@@ -733,28 +839,26 @@ async function runPublishOperation(
 	const awaitState = canAwait ? (this.getNodeParameter('awaitState', i, false) as boolean) : false;
 
 	if (awaitState && meta.stateTopic) {
-		const awaitTimeoutMs = this.getNodeParameter('awaitTimeoutMs', i, 5000) as number;
+		const awaitTimeoutMs = clampTimeoutMs(this.getNodeParameter('awaitTimeoutMs', i, 5000) as number);
 		const stateTopic = resolveTopicTemplate(meta.stateTopic, replacements);
-		const message = await publishAndAwaitState(
-			wsUrl,
-			headers,
-			topic,
-			payload,
-			stateTopic,
-			awaitTimeoutMs,
-		);
+		const message = await session.publishAndAwait(topic, payload, stateTopic, awaitTimeoutMs);
+		const received = message !== undefined;
 		return {
 			operation,
 			topic,
 			payload,
 			published: true,
-			confirmed: message !== undefined,
+			// `received` = a /state frame arrived; `confirmed` = that frame's value
+			// actually matches what we asked for. They differ when Frigate emits a
+			// concurrent/old value or drops a no-op set.
+			received,
+			confirmed: received && valuesMatch(payload, message?.payload),
 			stateTopic,
 			stateValue: message ? (message.payload as IDataObject) : null,
 		};
 	}
 
-	await publishEnvelope(wsUrl, headers, topic, payload);
+	await session.publish(topic, payload);
 	return { operation, topic, payload, published: true };
 }
 
@@ -767,11 +871,39 @@ function resolvePayload(this: IExecuteFunctions, operation: string, i: number): 
 	}
 
 	switch (operation) {
-		case 'setMotionThreshold':
-		case 'setMotionContourArea':
-			return String(this.getNodeParameter('numericValue', i) as number);
-		case 'suspendNotifications':
-			return String(this.getNodeParameter('minutes', i) as number);
+		case 'setMotionThreshold': {
+			const v = this.getNodeParameter('motionThreshold', i) as number;
+			if (!Number.isInteger(v) || v < 0 || v > 255) {
+				throw new NodeOperationError(
+					this.getNode(),
+					'Motion threshold must be an integer between 0 and 255.',
+					{ itemIndex: i },
+				);
+			}
+			return String(v);
+		}
+		case 'setMotionContourArea': {
+			const v = this.getNodeParameter('motionContourArea', i) as number;
+			if (!Number.isInteger(v) || v < 0 || v > 10000) {
+				throw new NodeOperationError(
+					this.getNode(),
+					'Motion contour area must be an integer between 0 and 10000.',
+					{ itemIndex: i },
+				);
+			}
+			return String(v);
+		}
+		case 'suspendNotifications': {
+			const v = this.getNodeParameter('minutes', i) as number;
+			if (!Number.isInteger(v) || v < 0 || v > 10080) {
+				throw new NodeOperationError(
+					this.getNode(),
+					'Minutes must be an integer between 0 and 10080.',
+					{ itemIndex: i },
+				);
+			}
+			return String(v);
+		}
 		case 'setBirdseyeMode':
 			return this.getNodeParameter('birdseyeMode', i) as string;
 		case 'ptz': {
@@ -806,4 +938,36 @@ function coercePayload(rawPayload: string): unknown {
 		return '';
 	}
 	return normalizePayload(rawPayload);
+}
+
+/**
+ * Clamp a user-supplied timeout (which may be negative, fractional, NaN, or huge
+ * via an expression) into a sane [0, 600000] ms range so it cannot hold a socket
+ * or worker open indefinitely.
+ */
+function clampTimeoutMs(value: number): number {
+	if (!Number.isFinite(value)) {
+		return 5000;
+	}
+	return Math.min(Math.max(value, 0), 600000);
+}
+
+/**
+ * Compare the value we asked Frigate to set against the value echoed back on the
+ * /state topic, tolerating string/number representation differences (e.g. 'ON'
+ * vs 'on', '30' vs 30). Used so "confirmed" means the value actually took effect,
+ * not merely that some /state frame arrived.
+ */
+function valuesMatch(expected: string, actual: unknown): boolean {
+	if (actual === undefined || actual === null) {
+		return false;
+	}
+	const e = String(expected).trim();
+	const a = String(actual).trim();
+	if (e.toLowerCase() === a.toLowerCase()) {
+		return true;
+	}
+	const en = Number(e);
+	const an = Number(a);
+	return !Number.isNaN(en) && !Number.isNaN(an) && en === an;
 }

@@ -102,13 +102,12 @@ export const eventOptions: INodePropertyOptions[] = [
 		description: "Topic 'zone/all/active'. Total active object count in a zone changes.",
 	},
 
-	// --- Snapshot (binary) ---
-	{
-		name: 'Best Snapshot Image',
-		value: '<camera>/<object>/snapshot',
-		description:
-			"Topic 'camera/object/snapshot'. Best frame for an object type; payload is raw JPEG bytes (emitted base64).",
-	},
+	// NOTE: the per-object snapshot topic (frigate/<camera>/<object>/snapshot) is
+	// intentionally NOT offered here. Frigate publishes its JPEG bytes only over
+	// MQTT — its /ws communicator JSON-serializes every envelope and silently drops
+	// non-text (binary) payloads, so the snapshot is unreachable over /ws on every
+	// Frigate version. Use MQTT, or the HTTP API (/api/events/<id>/snapshot.jpg),
+	// to retrieve snapshot images.
 
 	// --- Audio ---
 	{

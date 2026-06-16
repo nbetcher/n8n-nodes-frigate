@@ -44,8 +44,8 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 | Snapshots (`snapshots/set`) | Yes (Set Snapshots) | Yes (`switch.<cam>_snapshots`) | |
 | Improve contrast (`improve_contrast/set`) | Yes (Set Improve Contrast) | Yes (`switch.<cam>_improve_contrast`) | |
 | Audio detection (`audio/set`) | Yes (Set Audio Detection) | Yes (`switch.<cam>_audio`) | |
-| Motion threshold (`motion_threshold/set`) | Yes (Set Motion Threshold) | Yes (`number.<cam>_threshold`, 0–255) | n8n sends a bare integer; HA exposes a bounded number entity. |
-| Motion contour area (`motion_contour_area/set`) | Yes (Set Motion Contour Area) | Yes (`number.<cam>_contour_area`, 0–10000) | |
+| Motion threshold (`motion_threshold/set`) | Yes (Set Motion Threshold) | Yes (`number.<cam>_threshold`, 0–255) | Both bound the value 0–255 (n8n's **Threshold** field is integer 0–255); n8n sends it as a bare integer. |
+| Motion contour area (`motion_contour_area/set`) | Yes (Set Motion Contour Area) | Yes (`number.<cam>_contour_area`, 0–10000) | n8n's **Contour Area** field is integer 0–10000. |
 | Birdseye inclusion (`birdseye/set`) | Yes (Set Birdseye) | via custom topic | Frigate exposes `frigate/<cam>/birdseye/set`, but it does not surface as a dedicated HA switch in every version. |
 | Birdseye mode (`birdseye_mode/set`: CONTINUOUS/MOTION/OBJECTS) | Yes (Set Birdseye Mode) | No | Not a dedicated HA entity. |
 | Motion mask enable/disable (`motion_mask/<name>/set`) | Yes (Set Motion Mask) | No | n8n-only dedicated operation. |
@@ -53,7 +53,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 | Zone enable/disable (`zone/<name>/set`) | Yes (Set Zone) | No | n8n-only dedicated operation. |
 | Restart Frigate (`restart`) | Yes (Restart) | via API | HA has no dedicated restart service; n8n publishes the `restart` topic. |
 | Live video stream entity | No | Yes (`camera.<cam>` / WebRTC / birdseye) | HA restreams RTSP/go2rtc as a camera entity. n8n is not a media-rendering surface. |
-| Await `/state` confirmation after a write | Yes (optional toggle, with timeout) | Partial | n8n can block until the matching `/state` read-back arrives; HA updates the entity asynchronously when the state topic is published. |
+| Await `/state` confirmation after a write | Yes (optional toggle, with timeout) | Partial | n8n can block until the matching `/state` read-back arrives and returns both `received` (a frame arrived) and `confirmed` (the frame's value actually matches the requested value); HA updates the entity asynchronously when the state topic is published. |
 
 ### 3. PTZ
 
@@ -63,7 +63,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 | PTZ presets (`preset_<name>`) | Yes (preset custom value) | Yes (`ptz_argument`) | |
 | PTZ relative move (`MOVE_RELATIVE_<pan>_<tilt>[_<zoom>]`) | Yes (relative custom value) | Partial | n8n exposes a free-text relative payload; HA passes through `ptz_argument`. |
 | PTZ autotracker toggle (`ptz_autotracker/set`) | Yes (Set PTZ Autotracker) | Yes (`switch.<cam>_ptz_autotracker`) | |
-| PTZ autotracker *state* read-back | Yes (trigger / Get Current Value) | Yes (switch state) | |
+| PTZ autotracker *state* read-back | Yes (trigger / Wait for Next Topic Value) | Yes (switch state) | |
 | PTZ autotracker *actively tracking* (`ptz_autotracker/active`) | Yes (trigger) | No | n8n exposes the live "is tracking right now" feed; not a dedicated HA entity. |
 | PTZ command read-back / ack | No (fire-and-forget, no `/state`) | No | Frigate publishes no `/state` for `ptz`; both are fire-and-forget. |
 
@@ -103,7 +103,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 
 | Capability | This n8n node | HA Frigate integration | Notes |
 |---|---|---|---|
-| Best-snapshot image push (`<cam>/<object>/snapshot`, binary JPEG) | Yes (Best Snapshot Image trigger; emitted as base64) | Yes (`image.<cam>_<object>` / older `camera` snapshot entity) | n8n delivers the raw JPEG bytes (base64) per push; HA renders it as an image entity. |
+| Best-snapshot image push (`<cam>/<object>/snapshot`, binary JPEG) | No over /ws — Frigate sends snapshot bytes only via MQTT; use the HTTP API | Yes (`image.<cam>_<object>` / older `camera` snapshot entity) | Frigate's `/ws` communicator JSON-serializes every envelope and drops binary payloads, so snapshots never arrive over `/ws`. Fetch via HTTP (`/api/events/<id>/snapshot.jpg`) or consume the MQTT topic; HA renders it as an image entity. |
 | Event clips / recordings browsing | No | Yes (Media Browser: events, snapshots, recordings, VOD HLS) | HA's `media_source` browses `vod/...`, `api/events`, recordings by month/day/hour. Out of scope for the `/ws` node. |
 | Export a recording clip | No (not via `/ws`) | Yes (`frigate.export_recording`) | Uses Frigate HTTP API (`/api/export/...`), which this node does not call. Reachable from n8n's generic HTTP Request node, but not from this node. |
 | Event preview GIF / thumbnail / clip URLs | No | Yes (notification proxy `/api/frigate/.../notifications/...`) | HA-specific unauthenticated proxy over Frigate's `/api/events/<id>/{thumbnail,snapshot,clip,preview}`. |
@@ -118,7 +118,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 | Global notifications toggle (`notifications/set`) | Yes (Set Global Notifications) | via custom topic | Frigate exposes the global topic; HA does not always surface a dedicated global switch. |
 | Per-camera notifications toggle (`<cam>/notifications/set`) | Yes (Set Per-Camera Notifications) | Partial | |
 | Suspend per-camera notifications for N minutes (`notifications/suspend`) | Yes (Suspend Per-Camera Notifications) | No | n8n-only dedicated operation; read-back via `notifications/suspended`. |
-| Global / per-camera notifications *state* read-back | Yes (triggers + Get Current Value) | Partial | |
+| Global / per-camera notifications *state* read-back | Yes (triggers + Wait for Next Topic Value) | Partial | |
 | GenAI object descriptions toggle (`object_descriptions/set`, 0.16+) | Yes (Set Object Descriptions) | Yes (`switch.<cam>_object_descriptions`, 0.17+) | |
 | GenAI review descriptions toggle (`review_descriptions/set`, 0.16+) | Yes (Set Review Descriptions) | Yes (`switch.<cam>_review_descriptions`, 0.17+) | |
 | Review alerts toggle (`review_alerts/set`, 0.14+) | Yes (Set Review Alerts) | Yes (`switch.<cam>_review_alerts`) | |
@@ -136,7 +136,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 | Username/password login → JWT | Yes (`POST /api/login`, caches JWT, re-login on 401) | Yes | n8n logs in inside the node because `/ws` is not a plain HTTP endpoint. |
 | Pre-issued Bearer / JWT token | Yes (Bearer / JWT Token method) | Partial | HA typically uses its own configured auth; n8n accepts a raw JWT directly. |
 | JWT as cookie *and* Authorization header | Yes (both sent on `/ws` upgrade + HTTP) | Yes | |
-| Credential "Test" button | Yes (`GET /api/version`) | n/a (config flow validates at setup) | |
+| Credential "Test" button | Yes (real auth check: `POST /api/login` for password, authenticated `GET /api/config` for token, `GET /api/version` when auth disabled) | n/a (config flow validates at setup) | A wrong password / bad token fails the test. |
 | Multiple Frigate instances | Yes (one credential per instance) | Yes (`topic_prefix`/`client_id` per instance) | |
 
 ### 9. Transport / protocol
@@ -145,7 +145,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 |---|---|---|---|
 | Primary real-time transport | Frigate WebSocket `/ws` | MQTT (`frigate/...`) | **Key difference.** n8n consumes the same broadcast feed as the Frigate web UI; HA requires an MQTT broker. |
 | Requires an external MQTT broker | No | Yes | n8n needs only network access to Frigate's `/ws`. |
-| HTTP API usage (`/api/stats`, `/api/events`, `vod/...`) | Only `/api/login` + `/api/version` | Yes (stats, events, recordings, export, faces, PTZ info, chat) | Media/history/management features ride on the HTTP API, which this node deliberately does not wrap. |
+| HTTP API usage (`/api/stats`, `/api/events`, `vod/...`) | Only `/api/login` (JWT) + the credential-test probe (`/api/config` / `/api/version`) | Yes (stats, events, recordings, export, faces, PTZ info, chat) | Media/history/management features ride on the HTTP API, which this node deliberately does not wrap. |
 | `frigate/` topic prefix on the wire | Omitted (topics sent/received bare) | Present (MQTT `frigate/<...>`) | The node strips/ignores the prefix; matching is prefix-insensitive. |
 | Wire envelope | `{topic, payload}` only, **no** `retain` field | MQTT message + retain flag | `retain` is MQTT-only; over `/ws` retained topics are simply re-broadcast. |
 | Persistent connection with auto-reconnect | Yes (trigger: 1 socket, exponential backoff 5s→60s) | Yes (MQTT client) | Survives Frigate restarts and network drops. |
@@ -158,7 +158,7 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 |---|---|---|---|
 | Subscribe to an arbitrary `/ws` topic | Yes (Subscribe to Custom Topic) | Partial (raw HA `mqtt` trigger) | n8n matches client-side with `+`/`#`; in HA you'd add a manual `mqtt` trigger. |
 | Publish to an arbitrary command topic | Yes (Publish to Custom Topic) | Partial (raw `mqtt.publish`) | n8n sends a bare `{topic, payload}` envelope. |
-| Read the current/next value of any topic on demand | Yes (Get Current Value — subscribe once with timeout) | Partial (entity state read) | n8n opens `/ws`, waits for the next matching message, returns it, closes. |
+| Read the next value of any topic on demand | Yes (Wait for Next Topic Value — subscribe once with timeout) | Partial (entity state read) | n8n opens `/ws`, waits for the next matching message, returns it, closes. `/ws` does not replay current/retained state, so a quiet topic can time out. |
 | Forward-compatibility with new/unknown topics | Yes (custom topic ops cover anything not enumerated) | Partial (needs integration update for a new entity) | New Frigate topics work in n8n immediately via custom topic; HA generally needs a component release to expose a new entity. |
 | MQTT-style wildcard matching (`+` single, `#` multi) | Yes (client-side) | Yes (broker-side, if using raw `mqtt`) | n8n filters the broadcast stream itself since `/ws` has no per-topic server subscribe. |
 
@@ -190,8 +190,8 @@ Legend: **Yes** = first-class support · **No** = not supported · **Partial** =
 ## Notes & caveats
 
 - **Transport, not feature parity, is the deepest difference.** HA's real-time data is MQTT (`frigate/...`); this node's is the WebSocket `/ws`. Both ultimately observe the same Frigate broadcasts, but the node needs **no MQTT broker**. Topics over `/ws` **omit** the `frigate/` prefix and carry **no `retain` field** (retain is MQTT-only) — the node handles this transparently.
-- **Retained vs. broadcast.** Many `/state` and `available`/`notifications/state` topics are *retained* over MQTT, so an HA client gets the last value immediately on connect. Over `/ws` there is no retain; the node's **Get Current Value** operation works by waiting for the *next* broadcast of a topic within a timeout, which is reliable for read-backs that re-publish promptly but is not a guaranteed instant snapshot of a quiescent value.
-- **HTTP-API features are intentionally out of scope for this node.** Clip/recording browsing, export, manual event create/end/favorite, review summarize, faces, and the notification media proxy all ride on Frigate's HTTP API. This node wraps only `/api/login` (for JWT) and `/api/version` (credential test). Those HTTP features are still reachable from n8n — just via the generic **HTTP Request** node, not via this Frigate node.
+- **Retained vs. broadcast.** Many `/state` and `available`/`notifications/state` topics are *retained* over MQTT, so an HA client gets the last value immediately on connect. Over `/ws` there is no retain; the node's **Wait for Next Topic Value** operation works by waiting for the *next* broadcast of a topic within a timeout, which is reliable for read-backs that re-publish promptly but is not a guaranteed instant snapshot of a quiescent value (a quiet topic times out).
+- **HTTP-API features are intentionally out of scope for this node.** Clip/recording browsing, export, manual event create/end/favorite, review summarize, faces, and the notification media proxy all ride on Frigate's HTTP API. This node wraps only `/api/login` (for JWT) and the credential-test probe (`/api/config` for token auth, `/api/version` when auth is disabled). Those HTTP features are still reachable from n8n — just via the generic **HTTP Request** node, not via this Frigate node.
 - **HA's notification proxy is HA-specific.** `/api/frigate/<client_id>/notifications/...` is a Home Assistant convenience that re-exposes Frigate's `/api/events/<id>/{thumbnail,snapshot,clip,preview}` (optionally unauthenticated). n8n would hit the Frigate backend endpoints directly.
 - **HA pre-creates one entity per camera×object×feature; the node uses wildcards.** Leaving a placeholder field blank in the trigger becomes an MQTT-style `+` single-level wildcard, so one trigger can watch all cameras/objects/zones at once — no per-entity explosion, but also no pre-enumerated entity list.
 - **"Partial" on stats rows** means the data *is* present (inside the full `stats` payload the node emits) but is not broken out into individual metrics the way HA's dedicated sensors are. You extract the field you need in the workflow.

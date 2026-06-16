@@ -5,7 +5,7 @@ Each recipe is a full node-by-node description an AI can translate directly into
 Reminders that apply to every recipe:
 - Topics omit the `frigate/` prefix.
 - The `events` and `reviews` feeds fire on `new`/`update`/`end` — always filter on `payload.type`.
-- `$json.payload` for JSON topics is already a parsed object; scalar topics give a string/number; the snapshot topic gives base64 in `$json.binary`.
+- `$json.payload` for JSON topics is already a parsed object; scalar topics give a string/number. Snapshots are **not** delivered over `/ws` (Frigate publishes them only over MQTT) — fetch images via the HTTP API (`/api/events/<id>/snapshot.jpg`).
 
 ---
 
@@ -72,16 +72,16 @@ Requires `onvif` configured for `yard_cam` in Frigate.
    - `objects` = `{{$json.payload.after.data.objects}}`
    - `zones` = `{{$json.payload.after.data.zones}}`
    - `start` = `{{$json.payload.after.start_time}}`
-4. **(optional) Frigate** (`frigate`): `operation` = `getCurrentValue`, `customTopic` = `{{$json.camera}}/detect/state`, `timeoutMs` = `3000` to record whether detection was on.
+4. **(optional) Frigate** (`frigate`): `operation` = `getCurrentValue` (Wait for Next Topic Value), `customTopic` = `{{$json.camera}}/detect/state`, `timeoutMs` = `3000` to record whether detection changes during the window. Note: `/ws` does not replay current/retained state, so this returns only the *next* publish of the topic and times out if it stays unchanged.
 5. **Google Sheets / Postgres / HTTP Request** node — append the row.
 
-**Snapshot variant:** add a second **Frigate Trigger** with `event` = `<camera>/<object>/snapshot` (camera/object blank for all). The image arrives as base64 in `$json.binary`; convert it to a binary property (e.g. a **Convert to File / Move Binary Data** node) before emailing or uploading it.
+**Snapshot variant:** snapshots are **not** available over `/ws` (Frigate publishes snapshot bytes only over MQTT — the `/ws` communicator drops binary payloads). Fetch the image over the HTTP API instead: add an **HTTP Request** node hitting `http://<host>:5000/api/events/{{$json.payload.after.id}}/snapshot.jpg` (or `/api/<camera>/<label>/snapshot.jpg` for the latest best snapshot) and use its binary output before emailing or uploading it.
 
 ---
 
 ## Notes for translating to MCP calls
 
-- Always `get_node_types` for `frigateTrigger` and `frigate` first to confirm parameter names (`event`, `operation`, `camera`, `value`, `numericValue`, `minutes`, `birdseyeMode`, `ptzCommand`, `ptzCustomValue`, `maskName`, `zoneName`, `customTopic`, `customPayload`, `timeoutMs`, `awaitState`, `awaitTimeoutMs`).
+- Always `get_node_types` for `frigateTrigger` and `frigate` first to confirm parameter names (`event`, `operation`, `camera`, `value`, `motionThreshold`, `motionContourArea`, `minutes`, `birdseyeMode`, `ptzCommand`, `ptzCustomValue`, `maskName`, `zoneName`, `customTopic`, `customPayload`, `timeoutMs`, `awaitState`, `awaitTimeoutMs`).
 - The trigger node has no input; it is the workflow start node. The action node has one main input and one main output.
 - For the `events`/`reviews`/`tracked_object_update` feeds, expression paths start at `$json.payload.` (the payload is the parsed object). For count/state topics, the value is `$json.payload` directly.
 - Attach the `frigateApi` credential to every Frigate node via `setNodeCredential`; create the credential in the n8n UI if `list_credentials` shows none of type `frigateApi`.

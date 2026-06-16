@@ -1,9 +1,4 @@
-import type {
-	IAuthenticateGeneric,
-	ICredentialTestRequest,
-	ICredentialType,
-	INodeProperties,
-} from 'n8n-workflow';
+import type { IAuthenticateGeneric, ICredentialType, INodeProperties } from 'n8n-workflow';
 
 export class FrigateApi implements ICredentialType {
 	name = 'frigateApi';
@@ -151,23 +146,9 @@ export class FrigateApi implements ICredentialType {
 		},
 	};
 
-	// Lets the user click "Test" in the credential editor. Hits the public
-	// /api/version endpoint, which is available with or without auth.
-	//
-	// NOTE: this is a REACHABILITY check only — it does NOT validate login
-	// credentials. /api/version is served regardless of auth, and n8n's static
-	// credential test cannot perform the username/password /api/login round-trip,
-	// so a wrong password or blank token will still report success here. Auth is
-	// actually exercised at node/trigger run time (see buildAuthHeaders), which is
-	// where invalid credentials surface. Pointing this test at an auth-gated
-	// endpoint instead would false-negative the password method (whose header is
-	// only applied at runtime), so reachability is the safest declarative check.
-	test: ICredentialTestRequest = {
-		request: {
-			baseURL:
-				'={{ ($credentials.protocol === "https" ? "https" : "http") + "://" + $credentials.host + ":" + $credentials.port + ($credentials.pathPrefix || "") }}',
-			url: '/api/version',
-			method: 'GET',
-		},
-	};
+	// The credential's "Test" button is handled programmatically by the Frigate
+	// node (methods.credentialTest.frigateApiTest in Frigate.node.ts): it performs
+	// a real POST /api/login for the password method and an authenticated GET
+	// /api/config for the token method, so a wrong password / bad token correctly
+	// FAILS the test instead of passing an auth-agnostic /api/version probe.
 }

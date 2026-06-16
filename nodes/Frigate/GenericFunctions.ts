@@ -43,6 +43,19 @@ export interface IFrigateEnvelope {
 }
 
 /**
+ * Thrown for non-recoverable authentication/credential problems (a blank token,
+ * blank username/password, or a 400/401/403 from /api/login). Callers use this
+ * to fail fast instead of retrying a login that can never succeed (which would
+ * otherwise hammer Frigate's /api/login endpoint).
+ */
+export class FrigateAuthError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'FrigateAuthError';
+	}
+}
+
+/**
  * Build the ws:// or wss:// /ws URL from credentials.
  */
 export function buildWsUrl(credentials: IFrigateCredentials): string {
@@ -60,7 +73,7 @@ export function buildHttpBase(credentials: IFrigateCredentials): string {
 	return `${scheme}://${credentials.host}:${credentials.port}${prefix}`;
 }
 
-function normalizePrefix(pathPrefix?: string): string {
+export function normalizePrefix(pathPrefix?: string): string {
 	if (!pathPrefix) {
 		return '';
 	}
@@ -81,7 +94,8 @@ function normalizePrefix(pathPrefix?: string): string {
 /**
  * Perform a login against /api/login to obtain a JWT. Returns the bare token
  * string (without the "Bearer " prefix). The token is returned either in the
- * Set-Cookie header (frigate_token=...) or in the response body.
+ * Set-Cookie header (frigate_token=...) or in the response body. Throws a
+ * FrigateAuthError on a credential rejection so callers do not retry forever.
  */
 export async function frigateLogin(
 	context: IExecuteFunctions | ITriggerFunctions,
@@ -107,9 +121,14 @@ export async function frigateLogin(
 	};
 
 	if (response.statusCode && response.statusCode >= 400) {
-		throw new Error(
-			`Frigate login failed with status ${response.statusCode}. Check the configured username/password.`,
-		);
+		// 400/401/403 mean the credentials are wrong – retrying cannot fix them.
+		if ([400, 401, 403].includes(response.statusCode)) {
+			throw new FrigateAuthError(
+				`Frigate login was rejected (HTTP ${response.statusCode}). Check the configured username/password.`,
+			);
+		}
+		// Other statuses (e.g. 5xx) may be transient.
+		throw new Error(`Frigate login failed with status ${response.statusCode}.`);
 	}
 
 	// Prefer a token returned in the body.
@@ -133,7 +152,9 @@ export async function frigateLogin(
 		return cookieToken;
 	}
 
-	throw new Error('Frigate login succeeded but no JWT could be extracted from the response.');
+	throw new FrigateAuthError(
+		'Frigate login succeeded but no JWT could be extracted from the response.',
+	);
 }
 
 function extractFrigateToken(rawCookie: unknown): string | undefined {
@@ -152,7 +173,9 @@ function extractFrigateToken(rawCookie: unknown): string | undefined {
 
 /**
  * Resolve the auth headers (and cookie) to apply on the /ws upgrade request and
- * on HTTP calls. Returns an empty object when auth is disabled.
+ * on HTTP calls. Returns an empty object when auth is disabled, and throws a
+ * FrigateAuthError when auth is enabled but the required fields are missing or
+ * the login is rejected (so an explicitly-enabled auth never silently no-ops).
  */
 export async function buildAuthHeaders(
 	context: IExecuteFunctions | ITriggerFunctions,
@@ -166,13 +189,13 @@ export async function buildAuthHeaders(
 	if (credentials.authMethod === 'token') {
 		token = credentials.token;
 		if (!token) {
-			throw new Error(
+			throw new FrigateAuthError(
 				'Frigate auth is enabled with the Bearer/JWT method, but no token was provided in the credential.',
 			);
 		}
 	} else {
 		if (!credentials.username || !credentials.password) {
-			throw new Error(
+			throw new FrigateAuthError(
 				'Frigate auth is enabled with the username/password method, but the username or password is empty.',
 			);
 		}
@@ -180,7 +203,7 @@ export async function buildAuthHeaders(
 	}
 
 	if (!token) {
-		throw new Error('Frigate auth is enabled but no JWT could be obtained.');
+		throw new FrigateAuthError('Frigate auth is enabled but no JWT could be obtained.');
 	}
 
 	return {
@@ -269,12 +292,15 @@ function stripPrefix(topic: string): string {
 /**
  * Parse a raw inbound /ws frame into a normalized message. Structured payloads
  * are JSON-encoded strings nested in the envelope, so they are parsed a second
- * time. Scalar strings/numbers pass through. Binary payloads (e.g. the snapshot
- * topic) are emitted as a base64 string in `binary`.
+ * time. Scalar strings/numbers pass through. Binary frames (which Frigate's /ws
+ * does not actually emit – the snapshot bytes only go to MQTT – but which a
+ * proxy could theoretically deliver) are surfaced as base64 in `binary`.
  */
-export function parseInboundMessage(data: WebSocket.RawData, isBinary: boolean): IFrigateMessage | undefined {
+export function parseInboundMessage(
+	data: WebSocket.RawData,
+	isBinary: boolean,
+): IFrigateMessage | undefined {
 	if (isBinary && Buffer.isBuffer(data)) {
-		// A purely-binary frame with no JSON envelope (rare). Emit as base64.
 		return {
 			topic: '',
 			payload: null,
@@ -303,24 +329,24 @@ export function parseInboundMessage(data: WebSocket.RawData, isBinary: boolean):
 }
 
 /**
- * Normalize a payload value. JSON-encoded strings are parsed; everything else
- * passes through unchanged.
+ * Normalize a payload value. A string payload is JSON-parsed so that primitive
+ * payloads keep their native type: '123' -> 123, 'true' -> true, '10.5' -> 10.5,
+ * and '{...}'/'[...]' -> object/array. Non-JSON text (e.g. 'ON', 'online') fails
+ * the parse and is returned unchanged as a string. Non-strings pass through.
  */
 export function normalizePayload(rawPayload: unknown): unknown {
-	if (typeof rawPayload === 'string') {
-		const trimmed = rawPayload.trim();
-		if (
-			(trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-			(trimmed.startsWith('[') && trimmed.endsWith(']'))
-		) {
-			try {
-				return JSON.parse(trimmed);
-			} catch {
-				return rawPayload;
-			}
-		}
+	if (typeof rawPayload !== 'string') {
+		return rawPayload;
 	}
-	return rawPayload;
+	const trimmed = rawPayload.trim();
+	if (trimmed === '') {
+		return rawPayload;
+	}
+	try {
+		return JSON.parse(trimmed);
+	} catch {
+		return rawPayload;
+	}
 }
 
 /**
@@ -355,21 +381,79 @@ export function openSocket(wsUrl: string, headers: IDataObject): Promise<WebSock
 }
 
 /**
- * Publish a single envelope over a (short-lived) ws connection, then close it.
- * Fire-and-forget: resolves as soon as the frame has been flushed to the socket.
+ * Attach a one-shot listener to an already-open socket that resolves the first
+ * inbound message whose topic matches `awaitTopic` (or undefined on timeout).
+ * Optionally runs `onReady` (e.g. to publish a frame) after the listeners are
+ * attached so a fast read-back is not missed. Always detaches its own listeners
+ * on settle, leaving the socket's permanent no-op error guard in place.
  */
-export async function publishEnvelope(
-	wsUrl: string,
-	headers: IDataObject,
-	topic: string,
-	payload: unknown,
-): Promise<void> {
-	const ws = await openSocket(wsUrl, headers);
-	const message = JSON.stringify(buildEnvelope(topic, payload));
-	try {
+function waitForMatch(
+	ws: WebSocket,
+	awaitTopic: string,
+	timeoutMs: number,
+	onReady?: () => void,
+): Promise<IFrigateMessage | undefined> {
+	return new Promise<IFrigateMessage | undefined>((resolve, reject) => {
+		let settled = false;
+		const finish = (action: () => void) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(timer);
+			ws.removeListener('message', onMessage);
+			ws.removeListener('error', onError);
+			action();
+		};
+
+		const timer = setTimeout(() => finish(() => resolve(undefined)), timeoutMs);
+
+		const onMessage = (data: WebSocket.RawData, isBinary: boolean) => {
+			const parsed = parseInboundMessage(data, isBinary);
+			if (parsed && topicMatches(awaitTopic, parsed.topic)) {
+				finish(() => resolve(parsed));
+			}
+		};
+		const onError = (err: Error) => finish(() => reject(err));
+
+		ws.on('message', onMessage);
+		ws.once('error', onError);
+
+		if (onReady) {
+			onReady();
+		}
+	});
+}
+
+/**
+ * A single multiplexed /ws connection reused across every item of one node
+ * execution. Opening one socket for the whole batch (instead of one per item)
+ * avoids connection thrashing / ephemeral-port exhaustion, and closing it once
+ * at the end (rather than after each publish) removes the publish-then-close
+ * truncation race. The socket is lazily (re)opened, so a mid-batch drop is
+ * recovered transparently on the next operation.
+ */
+export class FrigateWsSession {
+	private ws?: WebSocket;
+
+	constructor(
+		private readonly wsUrl: string,
+		private readonly headers: IDataObject,
+	) {}
+
+	private async getSocket(): Promise<WebSocket> {
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			return this.ws;
+		}
+		this.ws = await openSocket(this.wsUrl, this.headers);
+		return this.ws;
+	}
+
+	/** Publish one envelope and resolve once the frame is flushed to the socket. */
+	async publish(topic: string, payload: unknown): Promise<void> {
+		const ws = await this.getSocket();
+		const message = JSON.stringify(buildEnvelope(topic, payload));
 		await new Promise<void>((resolve, reject) => {
-			// A post-open 'error' event with no listener crashes the process, so
-			// always handle it here.
 			const onError = (err: Error) => {
 				ws.removeListener('error', onError);
 				reject(err);
@@ -384,111 +468,53 @@ export async function publishEnvelope(
 				}
 			});
 		});
-	} finally {
+	}
+
+	/** Publish an envelope, then wait for the first matching read-back (or timeout). */
+	async publishAndAwait(
+		topic: string,
+		payload: unknown,
+		awaitTopic: string,
+		timeoutMs: number,
+	): Promise<IFrigateMessage | undefined> {
+		const ws = await this.getSocket();
+		const message = JSON.stringify(buildEnvelope(topic, payload));
+		return waitForMatch(ws, awaitTopic, timeoutMs, () => {
+			ws.send(message, (err) => {
+				if (err) {
+					// Surface the send failure through the same 'error' path waitForMatch
+					// is listening on, so the operation rejects instead of hanging.
+					ws.emit('error', err);
+				}
+			});
+		});
+	}
+
+	/** Wait for the next broadcast of a topic (does not publish). */
+	async subscribeOnce(
+		awaitTopic: string,
+		timeoutMs: number,
+	): Promise<IFrigateMessage | undefined> {
+		const ws = await this.getSocket();
+		return waitForMatch(ws, awaitTopic, timeoutMs);
+	}
+
+	/** Close the multiplexed socket, flushing any buffered frame first. */
+	async close(): Promise<void> {
+		const ws = this.ws;
+		this.ws = undefined;
+		if (!ws) {
+			return;
+		}
+		// Give a buffered final frame a moment to flush so the close handshake does
+		// not truncate it on a slow link.
+		if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > 0) {
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		ws.removeAllListeners();
+		// removeAllListeners() drops the no-op guard; re-add one so a post-close
+		// 'error' is not re-thrown as an uncaught exception.
+		ws.on('error', () => {});
 		ws.close();
 	}
-}
-
-/**
- * Open a ws connection, publish an envelope, then wait for the first inbound
- * message whose topic matches `awaitTopic` (up to timeoutMs). Returns the parsed
- * message or undefined on timeout. Used for "Await State Confirmation".
- */
-export async function publishAndAwaitState(
-	wsUrl: string,
-	headers: IDataObject,
-	topic: string,
-	payload: unknown,
-	awaitTopic: string,
-	timeoutMs: number,
-): Promise<IFrigateMessage | undefined> {
-	const ws = await openSocket(wsUrl, headers);
-
-	const result = await new Promise<IFrigateMessage | undefined>((resolve, reject) => {
-		const timer = setTimeout(() => {
-			cleanup();
-			resolve(undefined);
-		}, timeoutMs);
-
-		const onMessage = (data: WebSocket.RawData, isBinary: boolean) => {
-			const parsed = parseInboundMessage(data, isBinary);
-			if (parsed && topicMatches(awaitTopic, parsed.topic)) {
-				cleanup();
-				resolve(parsed);
-			}
-		};
-
-		// A post-open 'error' event with no listener crashes the process.
-		const onError = (err: Error) => {
-			cleanup();
-			reject(err);
-		};
-
-		const cleanup = () => {
-			clearTimeout(timer);
-			ws.removeListener('message', onMessage);
-			ws.removeListener('error', onError);
-		};
-
-		ws.on('message', onMessage);
-		ws.once('error', onError);
-
-		// Publish after listeners are attached so we don't miss a fast read-back.
-		ws.send(JSON.stringify(buildEnvelope(topic, payload)), (err) => {
-			if (err) {
-				onError(err);
-			}
-		});
-	}).finally(() => {
-		ws.close();
-	});
-
-	return result;
-}
-
-/**
- * Open a ws connection and resolve the first inbound message matching the given
- * topic (up to timeoutMs), then close. Used for "Get current value". Does not
- * publish anything – it only listens for the next broadcast of that topic.
- */
-export async function subscribeOnce(
-	wsUrl: string,
-	headers: IDataObject,
-	awaitTopic: string,
-	timeoutMs: number,
-): Promise<IFrigateMessage | undefined> {
-	const ws = await openSocket(wsUrl, headers);
-
-	const result = await new Promise<IFrigateMessage | undefined>((resolve, reject) => {
-		const timer = setTimeout(() => {
-			cleanup();
-			resolve(undefined);
-		}, timeoutMs);
-
-		const onMessage = (data: WebSocket.RawData, isBinary: boolean) => {
-			const parsed = parseInboundMessage(data, isBinary);
-			if (parsed && topicMatches(awaitTopic, parsed.topic)) {
-				cleanup();
-				resolve(parsed);
-			}
-		};
-
-		// A post-open 'error' event with no listener crashes the process.
-		const onError = (err: Error) => {
-			cleanup();
-			reject(err);
-		};
-
-		const cleanup = () => {
-			clearTimeout(timer);
-			ws.removeListener('message', onMessage);
-			ws.removeListener('error', onError);
-		};
-
-		ws.on('message', onMessage);
-		ws.once('error', onError);
-	}).finally(() => {
-		ws.close();
-	});
-	return result;
 }

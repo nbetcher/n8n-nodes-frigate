@@ -2,11 +2,12 @@
 
 Node `type`: `frigateTrigger`. Pick the topic with the **`event`** parameter; its value **is** the topic template (the `frigate/` prefix is always omitted on `/ws`). Fill placeholder fields to narrow the subscription; any placeholder left blank becomes an MQTT `+` single-level wildcard (match-all for that level). The `custom` event takes a free-text `customTopic` supporting `+` (single level) and `#` (multi level).
 
-**Emitted item shape:** `{ topic, payload, raw, binary? }`.
+**Emitted item shape:** `{ topic, payload, raw }`.
 - `topic` = the actual matched topic.
 - `payload` = parsed value. Structured (JSON) topics are double-parsed into a real object — do **not** parse again. Scalar topics give a string/number.
 - `raw` = the raw envelope string.
-- `binary` = present only for the snapshot topic (base64 JPEG); `payload` is then `null`.
+
+> **Note:** Frigate publishes snapshot bytes **only over MQTT** — its `/ws` communicator JSON-serializes every envelope and silently drops binary payloads, so the snapshot is unreachable over `/ws` on every Frigate version. Use MQTT or the HTTP API (`/api/events/<id>/snapshot.jpg`, `/api/<camera>/<label>/snapshot.jpg`) to retrieve snapshot images. There is no snapshot trigger event.
 
 Placeholder fields available on the node: `camera`, `object`, `zone`, `audioType`, `role`, `modelName`, and `customTopic` (custom only).
 
@@ -40,12 +41,6 @@ Placeholder fields available on the node: `camera`, `object`, `zone`, `audioType
 | `<zone>/<object>/active` | `driveway/car/active` | integer | zone, object |
 | `<zone>/all` | `driveway/all` | integer | zone |
 | `<zone>/all/active` | `driveway/all/active` | integer | zone |
-
-## Snapshot (binary)
-
-| `event` value | Topic | Payload | Placeholders |
-|---|---|---|---|
-| `<camera>/<object>/snapshot` | e.g. `front_door/person/snapshot` | **binary JPEG bytes** -> emitted as base64 in `binary` (`payload` is `null`) | camera, object |
 
 ## Audio
 
@@ -94,4 +89,4 @@ Placeholder fields available on the node: `camera`, `object`, `zone`, `audioType
 
 | `event` value | Topic | Payload | Notes |
 |---|---|---|---|
-| `custom` | `customTopic` (free text) | passthrough (JSON parsed when possible; scalars as-is; binary as base64 `binary`) | Supports `+` (single level) and `#` (multi level). Use to capture any topic not listed, or everything (`#`). |
+| `custom` | `customTopic` (free text) | passthrough (JSON parsed when possible; scalars as-is) | Supports `+` (single level) and `#` (multi level). Use to capture any topic not listed, or everything (`#`). |
