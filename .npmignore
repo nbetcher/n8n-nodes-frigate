@@ -15,3 +15,9 @@ gulpfile.js
 .idea
 *.log
 node_modules
+
+# Bundled in the repo but must NOT be published to npm. The package.json
+# "files" allowlist already restricts the tarball to dist/, so these are
+# excluded already; listed here as an explicit guard of intent.
+skill
+COMPARISON.md
