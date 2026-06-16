@@ -165,12 +165,22 @@ export async function buildAuthHeaders(
 	let token: string | undefined;
 	if (credentials.authMethod === 'token') {
 		token = credentials.token;
+		if (!token) {
+			throw new Error(
+				'Frigate auth is enabled with the Bearer/JWT method, but no token was provided in the credential.',
+			);
+		}
 	} else {
+		if (!credentials.username || !credentials.password) {
+			throw new Error(
+				'Frigate auth is enabled with the username/password method, but the username or password is empty.',
+			);
+		}
 		token = await frigateLogin(context, credentials);
 	}
 
 	if (!token) {
-		return {};
+		throw new Error('Frigate auth is enabled but no JWT could be obtained.');
 	}
 
 	return {
@@ -219,8 +229,13 @@ export function topicMatches(pattern: string, topic: string): boolean {
 	if (cleanPattern === cleanTopic) {
 		return true;
 	}
-	if (cleanPattern === '#' || cleanPattern === '') {
+	if (cleanPattern === '#') {
 		return true;
+	}
+	// An empty pattern matches nothing. Callers validate and reject blank topics
+	// up front; this guard prevents a stray '' from becoming a match-everything.
+	if (cleanPattern === '') {
+		return false;
 	}
 
 	const patternParts = cleanPattern.split('/');
@@ -229,8 +244,9 @@ export function topicMatches(pattern: string, topic: string): boolean {
 	for (let i = 0; i < patternParts.length; i++) {
 		const p = patternParts[i];
 		if (p === '#') {
-			// Multi-level wildcard matches the remainder (including zero levels).
-			return true;
+			// '#' is a multi-level wildcard only as the final segment (MQTT rule).
+			// A non-terminal '#' is malformed and matches nothing.
+			return i === patternParts.length - 1;
 		}
 		if (i >= topicParts.length) {
 			return false;
@@ -324,6 +340,12 @@ export function openSocket(wsUrl: string, headers: IDataObject): Promise<WebSock
 		};
 		const onOpen = () => {
 			ws.removeListener('error', onError);
+			// Keep a permanent no-op 'error' listener attached for the life of the
+			// socket. Under ws v8 an 'error' event with zero listeners is re-thrown
+			// as an uncaught exception (crashing the worker process); this can happen
+			// on an abnormal teardown AFTER callers have removed their own handler and
+			// called close(). This guard ensures there is always at least one listener.
+			ws.on('error', () => {});
 			resolve(ws);
 		};
 

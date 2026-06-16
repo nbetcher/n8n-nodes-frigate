@@ -1,10 +1,13 @@
 import type {
+	IBinaryData,
 	IDataObject,
+	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
 	ITriggerFunctions,
 	ITriggerResponse,
 } from 'n8n-workflow';
+import { NodeOperationError } from 'n8n-workflow';
 
 import WebSocket from 'ws';
 
@@ -213,16 +216,36 @@ export class FrigateTrigger implements INodeType {
 		let reconnectAttempts = 0;
 		let reconnectTimer: NodeJS.Timeout | undefined;
 
-		const emitMessage = (parsed: IFrigateMessage) => {
-			const item: IDataObject = {
+		const emitMessage = async (parsed: IFrigateMessage) => {
+			const json: IDataObject = {
 				topic: parsed.topic,
 				payload: parsed.payload as IDataObject,
 				raw: parsed.raw,
 			};
+			const item: INodeExecutionData = { json };
 			if (parsed.binary !== undefined) {
-				item.binary = parsed.binary;
+				// Emit the snapshot as real n8n binary data so downstream nodes
+				// (Write Binary File, HTTP upload, etc.) can consume it directly.
+				const prepare = (
+					this.helpers as unknown as {
+						prepareBinaryData?: (b: Buffer, f?: string, m?: string) => Promise<IBinaryData>;
+					}
+				).prepareBinaryData;
+				if (typeof prepare === 'function') {
+					item.binary = {
+						data: await prepare.call(
+							this.helpers,
+							Buffer.from(parsed.binary, 'base64'),
+							'snapshot.jpg',
+							'image/jpeg',
+						),
+					};
+				} else {
+					// Fallback when the binary helper is unavailable in this context.
+					json.binaryBase64 = parsed.binary;
+				}
 			}
-			this.emit([this.helpers.returnJsonArray([item])]);
+			this.emit([[item]]);
 		};
 
 		const connect = async () => {
@@ -236,6 +259,13 @@ export class FrigateTrigger implements INodeType {
 			} catch (error) {
 				this.logger.error(`Frigate Trigger auth failed: ${(error as Error).message}`);
 				scheduleReconnect();
+				return;
+			}
+
+			// Re-check after the (possibly slow) auth await: the workflow may have
+			// been deactivated while we awaited the login, in which case closeFunction
+			// has already run and would never close a socket created here.
+			if (manuallyClosed) {
 				return;
 			}
 
@@ -254,7 +284,9 @@ export class FrigateTrigger implements INodeType {
 			ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
 				const parsed = parseInboundMessage(data, isBinary);
 				if (parsed && topicMatches(subscriptionPattern, parsed.topic)) {
-					emitMessage(parsed);
+					void emitMessage(parsed).catch((err: Error) => {
+						this.logger.error(`Frigate Trigger failed to emit message: ${err.message}`);
+					});
 				}
 			});
 
@@ -297,7 +329,10 @@ export class FrigateTrigger implements INodeType {
 					handshakeTimeout: 10000,
 				});
 
+				let settled = false;
 				const timer = setTimeout(() => {
+					if (settled) return;
+					settled = true;
 					manualWs.close();
 					reject(new Error('Timed out waiting for a matching Frigate event.'));
 				}, MANUAL_TIMEOUT_MS);
@@ -305,16 +340,32 @@ export class FrigateTrigger implements INodeType {
 				manualWs.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
 					const parsed = parseInboundMessage(data, isBinary);
 					if (parsed && topicMatches(subscriptionPattern, parsed.topic)) {
+						if (settled) return;
+						settled = true;
 						clearTimeout(timer);
-						emitMessage(parsed);
+						void emitMessage(parsed).catch(() => {});
 						manualWs.close();
 						resolve();
 					}
 				});
 
 				manualWs.on('error', (err: Error) => {
+					if (settled) return;
+					settled = true;
 					clearTimeout(timer);
 					reject(err);
+				});
+
+				// Without a close handler, a clean server-side close before a match
+				// would leave the promise pending until the 30s timeout and then
+				// mis-report the cause.
+				manualWs.on('close', () => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					reject(
+						new Error('Frigate closed the connection before a matching event was received.'),
+					);
 				});
 			});
 		};
@@ -326,6 +377,10 @@ export class FrigateTrigger implements INodeType {
 			}
 			if (ws) {
 				ws.removeAllListeners();
+				// removeAllListeners() drops the 'error' handler; re-add a no-op so a
+				// post-close 'error' (abnormal teardown) is not re-thrown as an
+				// uncaught exception under ws v8.
+				ws.on('error', () => {});
 				ws.close();
 			}
 		};
@@ -346,7 +401,14 @@ function buildSubscriptionPattern(context: ITriggerFunctions): string {
 	const event = context.getNodeParameter('event', 0) as string;
 
 	if (event === 'custom') {
-		return context.getNodeParameter('customTopic', 0) as string;
+		const customTopic = ((context.getNodeParameter('customTopic', 0) as string) ?? '').trim();
+		if (!customTopic) {
+			throw new NodeOperationError(
+				context.getNode(),
+				'A Custom Topic is required when Event is set to "Custom topic".',
+			);
+		}
+		return customTopic;
 	}
 
 	const replacements: Record<string, string | undefined> = {

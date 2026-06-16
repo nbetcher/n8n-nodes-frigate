@@ -153,6 +153,15 @@ export class FrigateApi implements ICredentialType {
 
 	// Lets the user click "Test" in the credential editor. Hits the public
 	// /api/version endpoint, which is available with or without auth.
+	//
+	// NOTE: this is a REACHABILITY check only — it does NOT validate login
+	// credentials. /api/version is served regardless of auth, and n8n's static
+	// credential test cannot perform the username/password /api/login round-trip,
+	// so a wrong password or blank token will still report success here. Auth is
+	// actually exercised at node/trigger run time (see buildAuthHeaders), which is
+	// where invalid credentials surface. Pointing this test at an auth-gated
+	// endpoint instead would false-negative the password method (whose header is
+	// only applied at runtime), so reachability is the safest declarative check.
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL:

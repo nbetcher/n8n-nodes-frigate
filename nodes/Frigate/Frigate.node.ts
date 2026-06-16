@@ -67,8 +67,11 @@ const OPERATION_META: Record<string, IOperationMeta> = {
 		stateTopic: '<camera>/notifications/state',
 	},
 	suspendNotifications: {
+		// The /suspended read-back is a UNIX expiry timestamp, not the minutes
+		// value that was sent, so it is not a meaningful confirmation of the set.
+		// Treat suspend as fire-and-forget (no Await State Confirmation option).
 		setTopic: '<camera>/notifications/suspend',
-		stateTopic: '<camera>/notifications/suspended',
+		stateTopic: null,
 	},
 	setAudioTranscription: {
 		setTopic: '<camera>/audio_transcription/set',
@@ -530,13 +533,14 @@ export class Frigate implements INodeType {
 				type: 'string',
 				default: '',
 				required: true,
-				placeholder: 'front_door/detect/set',
+				placeholder: 'front_door/detect/state',
 				displayOptions: {
 					show: {
 						operation: ['publishCustom', 'getCurrentValue'],
 					},
 				},
-				description: "The bare topic (without the 'frigate/' prefix)",
+				description:
+					"The bare topic (without the 'frigate/' prefix). For Get Current Value, use a topic Frigate actually broadcasts (a /state topic or an event topic such as 'events') — Frigate does not echo /set command topics, so subscribing to a /set topic will always time out.",
 			},
 			{
 				displayName: 'Payload',
@@ -604,18 +608,28 @@ export class Frigate implements INodeType {
 		const credentials = (await this.getCredentials('frigateApi')) as unknown as IFrigateCredentials;
 		const wsUrl = buildWsUrl(credentials);
 
+		// Auth headers depend only on the credential, not on the item, so resolve
+		// them once (a password login is a full HTTP round-trip) and reuse them for
+		// every item instead of logging in per item.
+		let headers: IDataObject | undefined;
+
 		for (let i = 0; i < items.length; i++) {
 			try {
 				const operation = this.getNodeParameter('operation', i) as string;
-				const headers = await buildAuthHeaders(this, credentials);
+				if (headers === undefined) {
+					headers = await buildAuthHeaders(this, credentials);
+				}
 
-				let json: IDataObject;
+				const item: INodeExecutionData = { json: {}, pairedItem: { item: i } };
 
 				if (operation === 'getCurrentValue') {
 					const topic = this.getNodeParameter('customTopic', i) as string;
+					if (!topic) {
+						throw new NodeOperationError(this.getNode(), 'Topic is required.', { itemIndex: i });
+					}
 					const timeoutMs = this.getNodeParameter('timeoutMs', i, 5000) as number;
 					const message = await subscribeOnce(wsUrl, headers, topic, timeoutMs);
-					json = {
+					item.json = {
 						operation,
 						topic,
 						received: message !== undefined,
@@ -623,17 +637,29 @@ export class Frigate implements INodeType {
 						matchedTopic: message ? message.topic : null,
 						raw: message ? message.raw : null,
 					};
+					if (message?.binary !== undefined) {
+						item.binary = {
+							data: await this.helpers.prepareBinaryData(
+								Buffer.from(message.binary, 'base64'),
+								'snapshot.jpg',
+								'image/jpeg',
+							),
+						};
+					}
 				} else if (operation === 'publishCustom') {
 					const topic = this.getNodeParameter('customTopic', i) as string;
+					if (!topic) {
+						throw new NodeOperationError(this.getNode(), 'Topic is required.', { itemIndex: i });
+					}
 					const rawPayload = this.getNodeParameter('customPayload', i, '') as string;
 					const payload = coercePayload(rawPayload);
 					await publishEnvelope(wsUrl, headers, topic, payload);
-					json = { operation, topic, payload: payload as IDataObject, published: true };
+					item.json = { operation, topic, payload: payload as IDataObject, published: true };
 				} else {
-					json = await runPublishOperation.call(this, wsUrl, headers, operation, i);
+					item.json = await runPublishOperation.call(this, wsUrl, headers, operation, i);
 				}
 
-				returnData.push({ json, pairedItem: { item: i } });
+				returnData.push(item);
 			} catch (error) {
 				if (this.continueOnFail()) {
 					returnData.push({
@@ -681,10 +707,22 @@ async function runPublishOperation(
 
 	// Mask / zone name placeholders.
 	if (meta.setTopic.includes('<mask_name>')) {
-		replacements.mask_name = this.getNodeParameter('maskName', i) as string;
+		const maskName = this.getNodeParameter('maskName', i) as string;
+		if (!maskName) {
+			throw new NodeOperationError(this.getNode(), 'Mask Name is required for this operation.', {
+				itemIndex: i,
+			});
+		}
+		replacements.mask_name = maskName;
 	}
 	if (meta.setTopic.includes('<zone_name>')) {
-		replacements.zone_name = this.getNodeParameter('zoneName', i) as string;
+		const zoneName = this.getNodeParameter('zoneName', i) as string;
+		if (!zoneName) {
+			throw new NodeOperationError(this.getNode(), 'Zone Name is required for this operation.', {
+				itemIndex: i,
+			});
+		}
+		replacements.zone_name = zoneName;
 	}
 
 	const topic = resolveTopicTemplate(meta.setTopic, replacements);
